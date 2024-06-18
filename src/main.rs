@@ -1,43 +1,61 @@
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use resp::Value;
 use tokio::net::{TcpListener, TcpStream};
-
 use anyhow::Result;
-
+mod resp;
 #[tokio::main]
-async fn main() -> Result<()> {
-    println!("Logs from your program will appear here!");
-    let listener = TcpListener::bind("127.0.0.1:6379").await?;
-
+async fn main() {
+    let listener = TcpListener::bind("127.0.0.1:6379").await.unwrap();
+    
     loop {
-        let (stream, _) = listener.accept().await?;
-        println!("Accepted new connection");
-        tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream).await {
-                println!("Error: {}", e);
+        let stream = listener.accept().await;
+        match stream {
+            Ok((stream, _)) => {
+                println!("accepted new connection");
+                tokio::spawn(async move {
+                    handle_conn(stream).await
+                });
             }
-        });
+            Err(e) => {
+                println!("error: {}", e);
+            }
+        }
     }
 }
-
-async fn handle_connection(mut stream: TcpStream) -> Result<()> {
+async fn handle_conn(stream: TcpStream) {
+    let mut handler = resp::RespHandler::new(stream);
+    println!("Starting read loop");
     loop {
-        let mut buffer = [0; 1024];
-        let bytes_read = stream.read(&mut buffer).await?;
-        if bytes_read == 0 {
+        let value = handler.read_value().await.unwrap();
+        println!("Got value {:?}", value);
+        
+        let response = if let Some(v) = value {
+            let (command, args) = extract_command(v).unwrap();
+            match command.as_str() {
+                "ping" => Value::SimpleString("PONG".to_string()),
+                "echo" => args.first().unwrap().clone(),
+                c => panic!("Cannot handle command {}", c),
+            }
+        } else {
             break;
-        }
-
-        if let Err(e) = handle_request(&mut stream).await {
-            println!("Error: {}", e);
-        }
+        };
+        println!("Sending value {:?}", response);
+        handler.write_value(response).await.unwrap();
     }
-    Ok(())
 }
-
-async fn handle_request(stream: &mut TcpStream) -> Result<()> {
-    let response = b"+PONG\r\n";
-    stream.write_all(response).await?;
-    stream.flush().await?;
-    Ok(())
+fn extract_command(value: Value) -> Result<(String, Vec<Value>)> {
+    match value {
+        Value::Array(a) => {
+            Ok((
+                unpack_bulk_str(a.first().unwrap().clone())?,
+                a.into_iter().skip(1).collect(),
+            ))
+        },
+        _ => Err(anyhow::anyhow!("Unexpected command format")),
+    }
 }
-//Testing
+fn unpack_bulk_str(value: Value) -> Result<String> {
+    match value {
+        Value::BulkString(s) => Ok(s),
+        _ => Err(anyhow::anyhow!("Expected command to be a bulk string"))
+    }
+}
