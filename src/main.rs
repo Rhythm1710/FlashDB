@@ -4,7 +4,6 @@ use std::{
     net::TcpListener,
 };
 
-use bytes::buf;
 
 fn main() {
     // You can use print statements as follows for debugging, they'll be visible when running tests.
@@ -18,7 +17,7 @@ fn main() {
                 let mut buf = [0; 512];
                 stream.read(&mut buf).unwrap();
 
-                stream.write(b"PONG\r\n").unwrap();
+                stream.write(b"+PONG\r\n").unwrap();
             }
             Err(e) => {
                 println!("error: {}", e);
