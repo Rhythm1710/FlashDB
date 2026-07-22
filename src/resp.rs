@@ -1,6 +1,9 @@
-use tokio::{net::TcpStream, io::{AsyncReadExt, AsyncWriteExt}};
-use bytes::BytesMut;
 use anyhow::Result;
+use bytes::BytesMut;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::TcpStream,
+};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Value {
@@ -85,11 +88,12 @@ fn parse_simple_string(buffer: BytesMut) -> Result<(Value, usize)> {
 }
 
 fn parse_array(buffer: BytesMut) -> Result<(Value, usize)> {
-    let (array_length, mut bytes_consumed) = if let Some((line, len)) = read_until_crlf(&buffer[1..]) {
-        (parse_int(line)?, len + 1)
-    } else {
-        return Err(anyhow::anyhow!("Invalid array format {:?}", buffer));
-    };
+    let (array_length, mut bytes_consumed) =
+        if let Some((line, len)) = read_until_crlf(&buffer[1..]) {
+            (parse_int(line)?, len + 1)
+        } else {
+            return Err(anyhow::anyhow!("Invalid array format {:?}", buffer));
+        };
     let mut items = vec![];
     for _ in 0..array_length {
         let (array_item, len) = parse_message(BytesMut::from(&buffer[bytes_consumed..]))?;
@@ -135,10 +139,7 @@ mod tests {
 
     #[test]
     fn serialize_error() {
-        assert_eq!(
-            Value::Error("ERR bad".into()).serialize(),
-            "-ERR bad\r\n"
-        );
+        assert_eq!(Value::Error("ERR bad".into()).serialize(), "-ERR bad\r\n");
     }
 
     #[test]
@@ -159,10 +160,7 @@ mod tests {
 
     #[test]
     fn serialize_array() {
-        let v = Value::Array(vec![
-            Value::BulkString("a".into()),
-            Value::Integer(1),
-        ]);
+        let v = Value::Array(vec![Value::BulkString("a".into()), Value::Integer(1)]);
         assert_eq!(v.serialize(), "*2\r\n$1\r\na\r\n:1\r\n");
     }
 
