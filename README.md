@@ -1,26 +1,48 @@
 # FlashDB
 
-A Redis clone written from scratch in Rust.
+A Redis-compatible, in-memory database written from scratch in Rust.
 
-## Build
+FlashDB speaks the [RESP protocol](https://redis.io/docs/latest/develop/reference/protocol-spec/),
+so you can talk to it with any Redis client (`redis-cli`, language bindings, `redis-benchmark`).
 
-FlashDB doesn't have any external dependencies.
-You can either run it directly:
+## Build & run
 
-```
+FlashDB has a small dependency set (async runtime + buffers). Run it directly:
+
+```sh
 cargo run --release
 ```
 
-Or you can build it and use -p to specify the port and -t to specify a conenction timeout in milliseconds.
+This starts the server on `127.0.0.1:6379`. Connect with any Redis client:
 
+```sh
+redis-cli -p 6379 ping
+# PONG
 ```
-cargo build -- release
-./target/debug/sider -p 3000 -t 10
+
+Or build a release binary and run it:
+
+```sh
+cargo build --release
+./target/release/flashdb
 ```
 
-## Implemented commands (so far):
+## Implemented commands
 
-- SET
-- GET
-- DEL
-- ECHO
+- `PING`
+- `ECHO`
+- `SET`
+- `GET`
+- `DEL`
+
+## Development
+
+```sh
+cargo test              # run the test suite
+cargo clippy -- -D warnings
+cargo fmt
+```
+
+## License
+
+MIT — see [LICENSE](LICENSE).
