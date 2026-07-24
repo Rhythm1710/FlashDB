@@ -31,7 +31,18 @@ async fn handle_conn(stream: TcpStream, storage: Store) -> Result<()> {
         let value = match handler.read_value().await {
             Ok(Some(v)) => v,
             Ok(None) => break,
-            Err(e) => return Err(e),
+            Err(e) => {
+                // A protocol violation gets an error reply before we hang
+                // up, like real Redis; the parser can't resync after
+                // garbage, so keeping the connection open isn't safe.
+                // IO errors (client vanished) just propagate.
+                if let Some(proto) = e.downcast_ref::<resp::ProtocolError>() {
+                    let reply = Value::Error(format!("ERR {}", proto));
+                    let _ = handler.write_value(reply).await;
+                    return Ok(());
+                }
+                return Err(e);
+            }
         };
 
         // A malformed request produces an error reply, not a dropped
