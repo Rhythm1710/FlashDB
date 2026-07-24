@@ -35,6 +35,13 @@ cargo build --release
 - `GET`
 - `DEL`
 
+## Protocol notes
+
+The RESP parser is incremental: a frame split across multiple TCP segments
+is reassembled, and a pipelined batch of commands sent in one segment is
+answered in order, one reply per command. Malformed input gets a
+Redis-style `-ERR Protocol error` reply before the connection is closed.
+
 ## Development
 
 ```sh
