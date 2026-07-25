@@ -1,0 +1,192 @@
+//! End-to-end tests that start a real FlashDB server on an ephemeral port and
+//! drive it over a genuine TCP socket, sending raw RESP bytes and asserting on
+//! the raw RESP bytes that come back. Where the parser unit tests prove single
+//! frames parse correctly in isolation, these prove the whole pipeline —
+//! accept, read, dispatch, reply — behaves against a live client.
+
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+
+/// Start a server on 127.0.0.1:0 (the OS picks a free port) and return its
+/// address. The server runs on a background task for the life of the test; the
+/// task is dropped when the test ends, which is fine for a short-lived test.
+async fn start_server() -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = flashdb::run(listener).await;
+    });
+    addr
+}
+
+/// Connect a fresh client to the running server.
+async fn connect(addr: std::net::SocketAddr) -> TcpStream {
+    TcpStream::connect(addr).await.unwrap()
+}
+
+/// Send raw bytes to the server.
+async fn send(stream: &mut TcpStream, bytes: &[u8]) {
+    stream.write_all(bytes).await.unwrap();
+}
+
+/// Read until we have accumulated at least `expected.len()` bytes, then assert
+/// the reply matches exactly. TCP may deliver a reply in several chunks, so we
+/// keep reading until the whole expected reply has arrived.
+async fn expect_reply(stream: &mut TcpStream, expected: &str) {
+    let want = expected.as_bytes();
+    let mut got = Vec::new();
+    let mut chunk = [0u8; 256];
+    while got.len() < want.len() {
+        let n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut chunk))
+            .await
+            .expect("timed out waiting for reply")
+            .expect("read failed");
+        assert_ne!(n, 0, "server closed connection early; got so far: {got:?}");
+        got.extend_from_slice(&chunk[..n]);
+    }
+    assert_eq!(
+        String::from_utf8_lossy(&got),
+        expected,
+        "unexpected reply bytes"
+    );
+}
+
+#[tokio::test]
+async fn ping_returns_pong() {
+    let addr = start_server().await;
+    let mut client = connect(addr).await;
+    send(&mut client, b"*1\r\n$4\r\nPING\r\n").await;
+    expect_reply(&mut client, "+PONG\r\n").await;
+}
+
+#[tokio::test]
+async fn ping_echoes_its_argument() {
+    let addr = start_server().await;
+    let mut client = connect(addr).await;
+    send(&mut client, b"*2\r\n$4\r\nPING\r\n$5\r\nhello\r\n").await;
+    expect_reply(&mut client, "$5\r\nhello\r\n").await;
+}
+
+#[tokio::test]
+async fn echo_returns_its_argument() {
+    let addr = start_server().await;
+    let mut client = connect(addr).await;
+    send(&mut client, b"*2\r\n$4\r\nECHO\r\n$3\r\nhey\r\n").await;
+    expect_reply(&mut client, "$3\r\nhey\r\n").await;
+}
+
+#[tokio::test]
+async fn set_then_get_round_trips_the_value() {
+    let addr = start_server().await;
+    let mut client = connect(addr).await;
+    send(
+        &mut client,
+        b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n",
+    )
+    .await;
+    expect_reply(&mut client, "+OK\r\n").await;
+    send(&mut client, b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n").await;
+    expect_reply(&mut client, "$3\r\nbar\r\n").await;
+}
+
+#[tokio::test]
+async fn get_missing_key_returns_null() {
+    let addr = start_server().await;
+    let mut client = connect(addr).await;
+    send(&mut client, b"*2\r\n$3\r\nGET\r\n$7\r\nmissing\r\n").await;
+    expect_reply(&mut client, "$-1\r\n").await;
+}
+
+#[tokio::test]
+async fn del_reports_the_number_of_keys_removed() {
+    let addr = start_server().await;
+    let mut client = connect(addr).await;
+    send(&mut client, b"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n").await;
+    expect_reply(&mut client, "+OK\r\n").await;
+    send(&mut client, b"*3\r\n$3\r\nSET\r\n$1\r\nb\r\n$1\r\n2\r\n").await;
+    expect_reply(&mut client, "+OK\r\n").await;
+    // Two of the three keys exist, so DEL should count 2.
+    send(
+        &mut client,
+        b"*4\r\n$3\r\nDEL\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n",
+    )
+    .await;
+    expect_reply(&mut client, ":2\r\n").await;
+}
+
+#[tokio::test]
+async fn pipelined_commands_each_get_a_reply_in_order() {
+    let addr = start_server().await;
+    let mut client = connect(addr).await;
+    // Two commands written in a single segment; both replies must come back
+    // in order, proving the server drains a pipelined buffer one frame at a
+    // time rather than only handling the first.
+    send(
+        &mut client,
+        b"*1\r\n$4\r\nPING\r\n*2\r\n$4\r\nECHO\r\n$2\r\nhi\r\n",
+    )
+    .await;
+    expect_reply(&mut client, "+PONG\r\n$2\r\nhi\r\n").await;
+}
+
+#[tokio::test]
+async fn a_frame_split_across_writes_is_reassembled() {
+    let addr = start_server().await;
+    let mut client = connect(addr).await;
+    // Deliberately split one PING frame across two writes with a pause; the
+    // server must buffer the first half and wait rather than error.
+    send(&mut client, b"*1\r\n$4\r\nPI").await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    send(&mut client, b"NG\r\n").await;
+    expect_reply(&mut client, "+PONG\r\n").await;
+}
+
+#[tokio::test]
+async fn unknown_command_gets_an_error_reply() {
+    let addr = start_server().await;
+    let mut client = connect(addr).await;
+    send(&mut client, b"*1\r\n$7\r\nNOSUCH0\r\n").await;
+    expect_reply(&mut client, "-ERR unknown command 'nosuch0'\r\n").await;
+}
+
+#[tokio::test]
+async fn wrong_arity_gets_an_error_but_keeps_the_connection() {
+    let addr = start_server().await;
+    let mut client = connect(addr).await;
+    send(&mut client, b"*1\r\n$3\r\nGET\r\n").await;
+    expect_reply(
+        &mut client,
+        "-ERR wrong number of arguments for 'get' command\r\n",
+    )
+    .await;
+    // The connection should still be usable after an application-level error.
+    send(&mut client, b"*1\r\n$4\r\nPING\r\n").await;
+    expect_reply(&mut client, "+PONG\r\n").await;
+}
+
+#[tokio::test]
+async fn garbage_input_gets_a_protocol_error_then_the_server_closes() {
+    let addr = start_server().await;
+    let mut client = connect(addr).await;
+    // A byte that can never begin a valid RESP frame. The server replies with
+    // a protocol error and then hangs up, because it can't resync mid-stream.
+    send(&mut client, b"!oops\r\n").await;
+    let mut got = Vec::new();
+    let mut chunk = [0u8; 256];
+    loop {
+        let n = tokio::time::timeout(Duration::from_secs(2), client.read(&mut chunk))
+            .await
+            .expect("timed out")
+            .expect("read failed");
+        if n == 0 {
+            break; // server closed the connection, as expected
+        }
+        got.extend_from_slice(&chunk[..n]);
+    }
+    assert!(
+        got.starts_with(b"-ERR Protocol error:"),
+        "expected a protocol error reply, got: {}",
+        String::from_utf8_lossy(&got)
+    );
+}

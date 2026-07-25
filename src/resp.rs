@@ -309,7 +309,7 @@ mod tests {
         // or an error.
         let full = "*2\r\n$4\r\nECHO\r\n$3\r\nhey\r\n";
         for end in 0..full.len() {
-            let result = parse_message(full[..end].as_bytes());
+            let result = parse_message(&full.as_bytes()[..end]);
             assert_eq!(result, Ok(None), "truncated at byte {end}");
         }
     }
