@@ -1,5 +1,7 @@
 # FlashDB
 
+[![CI](https://github.com/Rhythm1710/FlashDB/actions/workflows/ci.yml/badge.svg)](https://github.com/Rhythm1710/FlashDB/actions/workflows/ci.yml)
+
 A Redis-compatible, in-memory database written from scratch in Rust.
 
 FlashDB speaks the [RESP protocol](https://redis.io/docs/latest/develop/reference/protocol-spec/),
@@ -44,11 +46,28 @@ Redis-style `-ERR Protocol error` reply before the connection is closed.
 
 ## Development
 
+The server logic lives in a library (`src/lib.rs`); `src/main.rs` is a thin
+binary that binds the listener and calls `flashdb::run`. Splitting it this way
+lets the integration tests start a real server on an ephemeral port and talk to
+it over a genuine TCP socket.
+
 ```sh
-cargo test              # run the test suite
-cargo clippy -- -D warnings
+cargo test              # parser unit tests + end-to-end integration tests
+cargo clippy --all-targets -- -D warnings
 cargo fmt
 ```
+
+Tests come in two layers: unit tests in `src/resp.rs` that prove single RESP
+frames parse and serialize correctly (including partial and malformed input),
+and integration tests in `tests/integration.rs` that drive a live server over
+TCP and assert on the raw bytes it sends back.
+
+## Continuous integration
+
+Every push and pull request against `master` runs the same gate through
+[GitHub Actions](.github/workflows/ci.yml): `cargo fmt --check`,
+`cargo clippy --all-targets -- -D warnings`, and `cargo test`. A red build
+means one of those failed.
 
 ## License
 
