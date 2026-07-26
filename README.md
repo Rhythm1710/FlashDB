@@ -33,9 +33,24 @@ cargo build --release
 
 - `PING`
 - `ECHO`
-- `SET`
+- `SET key value [EX seconds | PX milliseconds]`
 - `GET`
 - `DEL`
+- `EXPIRE key seconds`
+- `TTL key`
+- `PERSIST key`
+
+## Key expiry
+
+Keys can be given a time to live. `SET` takes an optional `EX <seconds>` or
+`PX <milliseconds>` to set a lifetime up front, and `EXPIRE key seconds` sets
+one on an existing key. `TTL key` returns the seconds remaining (`-1` if the
+key has no expiry, `-2` if it doesn't exist), and `PERSIST key` removes an
+expiry so the key lives forever again.
+
+Expiry is *passive*: a key past its deadline stays in memory until something
+touches it, at which point the read drops it and reports it as missing — so an
+expired key is indistinguishable from one that was never set.
 
 ## Protocol notes
 
