@@ -190,3 +190,71 @@ async fn garbage_input_gets_a_protocol_error_then_the_server_closes() {
         String::from_utf8_lossy(&got)
     );
 }
+
+#[tokio::test]
+async fn set_with_ex_is_readable_and_reports_its_ttl() {
+    let addr = start_server().await;
+    let mut client = connect(addr).await;
+    // SET k v EX 100
+    send(
+        &mut client,
+        b"*5\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n$2\r\nEX\r\n$3\r\n100\r\n",
+    )
+    .await;
+    expect_reply(&mut client, "+OK\r\n").await;
+    // The value is still there...
+    send(&mut client, b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n").await;
+    expect_reply(&mut client, "$1\r\nv\r\n").await;
+    // ...and TTL reports the full 100 seconds (rounded up from just under).
+    send(&mut client, b"*2\r\n$3\r\nTTL\r\n$1\r\nk\r\n").await;
+    expect_reply(&mut client, ":100\r\n").await;
+}
+
+#[tokio::test]
+async fn a_key_set_with_px_expires_and_reads_back_null() {
+    let addr = start_server().await;
+    let mut client = connect(addr).await;
+    // SET k v PX 30 — a 30ms lifetime.
+    send(
+        &mut client,
+        b"*5\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n$2\r\nPX\r\n$2\r\n30\r\n",
+    )
+    .await;
+    expect_reply(&mut client, "+OK\r\n").await;
+    // Wait past the deadline, then GET must see the key as gone.
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    send(&mut client, b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n").await;
+    expect_reply(&mut client, "$-1\r\n").await;
+    // TTL now reports -2: the key does not exist at all.
+    send(&mut client, b"*2\r\n$3\r\nTTL\r\n$1\r\nk\r\n").await;
+    expect_reply(&mut client, ":-2\r\n").await;
+}
+
+#[tokio::test]
+async fn expire_then_persist_round_trips_a_ttl() {
+    let addr = start_server().await;
+    let mut client = connect(addr).await;
+    // A plain key with no expiry: TTL is -1.
+    send(&mut client, b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n").await;
+    expect_reply(&mut client, "+OK\r\n").await;
+    send(&mut client, b"*2\r\n$3\r\nTTL\r\n$1\r\nk\r\n").await;
+    expect_reply(&mut client, ":-1\r\n").await;
+    // EXPIRE sets a timeout and reports 1; a missing key reports 0.
+    send(
+        &mut client,
+        b"*3\r\n$6\r\nEXPIRE\r\n$1\r\nk\r\n$3\r\n500\r\n",
+    )
+    .await;
+    expect_reply(&mut client, ":1\r\n").await;
+    send(
+        &mut client,
+        b"*3\r\n$6\r\nEXPIRE\r\n$7\r\nnokey00\r\n$2\r\n10\r\n",
+    )
+    .await;
+    expect_reply(&mut client, ":0\r\n").await;
+    // PERSIST strips the timeout back off, and TTL returns to -1.
+    send(&mut client, b"*2\r\n$7\r\nPERSIST\r\n$1\r\nk\r\n").await;
+    expect_reply(&mut client, ":1\r\n").await;
+    send(&mut client, b"*2\r\n$3\r\nTTL\r\n$1\r\nk\r\n").await;
+    expect_reply(&mut client, ":-1\r\n").await;
+}
