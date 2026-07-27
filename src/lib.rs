@@ -14,6 +14,32 @@ use tokio::net::{TcpListener, TcpStream};
 
 pub mod resp;
 
+/// The typed payload a key holds.
+///
+/// Until now every value was a bare `String`. Redis keys, though, come in
+/// several shapes — strings, lists, hashes, sets — and a command that meets
+/// the wrong shape (e.g. `LPUSH` on a string) must fail with a `WRONGTYPE`
+/// error rather than silently misbehave. Modelling the value as an enum makes
+/// "what kind of thing is stored here?" a fact the compiler tracks for us:
+/// every place that reads a value is forced to say what it does for each
+/// shape. Only `Str` exists today; `List`, `Hash`, and `Set` join their
+/// variants as those commands land (Phase 2.3 onward), at which point the
+/// accessors below grow their `WRONGTYPE` arms.
+pub enum StoredValue {
+    Str(String),
+}
+
+impl StoredValue {
+    /// The Redis type name reported by the `TYPE` command: `string`, and in
+    /// future `list` / `hash` / `set`. A missing key is handled by the caller
+    /// (Redis reports `none`), so there is no variant for it here.
+    fn type_name(&self) -> &'static str {
+        match self {
+            StoredValue::Str(_) => "string",
+        }
+    }
+}
+
 /// One stored value plus its optional expiry deadline.
 ///
 /// Splitting the value from its lifetime this way is what lets a key outlive
@@ -21,7 +47,7 @@ pub mod resp;
 /// `None` means "lives forever"; `Some(deadline)` means the key is gone the
 /// moment `Instant::now()` passes `deadline`.
 pub struct Entry {
-    value: String,
+    value: StoredValue,
     expires_at: Option<Instant>,
 }
 
@@ -135,6 +161,7 @@ pub fn process_command(value: Value, storage: &Store) -> Value {
         "expire" => expire(&args, storage),
         "ttl" => ttl(&args, storage),
         "persist" => persist(&args, storage),
+        "type" => type_cmd(&args, storage),
         c => Value::Error(format!("ERR unknown command '{}'", c)),
     }
 }
@@ -186,10 +213,14 @@ fn set(args: &[Value], storage: &Store) -> Value {
     }
 
     // A plain SET clears any previous TTL because we insert a fresh Entry.
-    storage
-        .lock()
-        .unwrap()
-        .insert(key, Entry { value, expires_at });
+    // SET always stores a string value, overwriting any prior type.
+    storage.lock().unwrap().insert(
+        key,
+        Entry {
+            value: StoredValue::Str(value),
+            expires_at,
+        },
+    );
     Value::SimpleString("OK".to_string())
 }
 
@@ -205,8 +236,30 @@ fn get(args: &[Value], storage: &Store) -> Value {
     let mut store = storage.lock().unwrap();
     expire_if_due(&mut store, &key, now);
     match store.get(&key) {
-        Some(e) => Value::BulkString(e.value.clone()),
+        Some(e) => match &e.value {
+            StoredValue::Str(s) => Value::BulkString(s.clone()),
+        },
         None => Value::Null,
+    }
+}
+
+/// `TYPE key` — report the kind of value stored at `key` as a simple string:
+/// `string` today (and `list` / `hash` / `set` once those exist), or `none`
+/// if the key is missing or has expired.
+fn type_cmd(args: &[Value], storage: &Store) -> Value {
+    if args.len() != 1 {
+        return wrong_args("type");
+    }
+    let key = match unpack_bulk_str(&args[0]) {
+        Ok(k) => k,
+        Err(e) => return Value::Error(format!("ERR {}", e)),
+    };
+    let now = Instant::now();
+    let mut store = storage.lock().unwrap();
+    expire_if_due(&mut store, &key, now);
+    match store.get(&key) {
+        Some(e) => Value::SimpleString(e.value.type_name().to_string()),
+        None => Value::SimpleString("none".to_string()),
     }
 }
 
@@ -358,7 +411,7 @@ mod tests {
     #[test]
     fn entry_without_expiry_never_expires_and_has_no_ttl() {
         let e = Entry {
-            value: "v".to_string(),
+            value: StoredValue::Str("v".to_string()),
             expires_at: None,
         };
         let now = Instant::now();
@@ -370,7 +423,7 @@ mod tests {
     fn entry_ttl_rounds_up_and_expires_on_deadline() {
         let now = Instant::now();
         let e = Entry {
-            value: "v".to_string(),
+            value: StoredValue::Str("v".to_string()),
             expires_at: Some(now + Duration::from_millis(1500)),
         };
         // 1.5s left rounds up to 2, and it is not yet expired.
@@ -471,5 +524,45 @@ mod tests {
         expire(&[bulk("k"), bulk("100")], &s);
         assert_eq!(persist(&[bulk("k")], &s), Value::Integer(1));
         assert_eq!(ttl(&[bulk("k")], &s), Value::Integer(-1));
+    }
+
+    #[test]
+    fn type_reports_string_for_a_set_key() {
+        let s = store();
+        set(&[bulk("k"), bulk("v")], &s);
+        assert_eq!(
+            type_cmd(&[bulk("k")], &s),
+            Value::SimpleString("string".to_string())
+        );
+    }
+
+    #[test]
+    fn type_reports_none_for_a_missing_key() {
+        let s = store();
+        assert_eq!(
+            type_cmd(&[bulk("missing")], &s),
+            Value::SimpleString("none".to_string())
+        );
+    }
+
+    #[test]
+    fn type_reports_none_after_a_key_expires() {
+        let s = store();
+        set(&[bulk("k"), bulk("v"), bulk("PX"), bulk("1")], &s);
+        std::thread::sleep(Duration::from_millis(5));
+        // Passive expiry runs on TYPE too, so a lapsed key looks absent.
+        assert_eq!(
+            type_cmd(&[bulk("k")], &s),
+            Value::SimpleString("none".to_string())
+        );
+    }
+
+    #[test]
+    fn type_checks_arity() {
+        let s = store();
+        assert_eq!(
+            type_cmd(&[], &s),
+            Value::Error("ERR wrong number of arguments for 'type' command".to_string())
+        );
     }
 }
