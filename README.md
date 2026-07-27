@@ -39,6 +39,16 @@ cargo build --release
 - `EXPIRE key seconds`
 - `TTL key`
 - `PERSIST key`
+- `TYPE key`
+
+## Value types
+
+Every key holds a typed value. Today the only type is `string`, but values are
+modelled as an enum so that lists, hashes, and sets can slot in without
+reworking the store — and so a command that meets the wrong type can reply with
+a `WRONGTYPE` error once more than one type exists. `TYPE key` reports the kind
+of value stored: `string` for a set key, or `none` if the key is missing or has
+expired.
 
 ## Key expiry
 
