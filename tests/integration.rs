@@ -258,3 +258,33 @@ async fn expire_then_persist_round_trips_a_ttl() {
     send(&mut client, b"*2\r\n$3\r\nTTL\r\n$1\r\nk\r\n").await;
     expect_reply(&mut client, ":-1\r\n").await;
 }
+
+#[tokio::test]
+async fn type_reports_string_for_a_set_key_and_none_otherwise() {
+    let addr = start_server().await;
+    let mut client = connect(addr).await;
+    // A missing key is 'none'.
+    send(&mut client, b"*2\r\n$4\r\nTYPE\r\n$1\r\nk\r\n").await;
+    expect_reply(&mut client, "+none\r\n").await;
+    // After a SET the key reports 'string'.
+    send(&mut client, b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n").await;
+    expect_reply(&mut client, "+OK\r\n").await;
+    send(&mut client, b"*2\r\n$4\r\nTYPE\r\n$1\r\nk\r\n").await;
+    expect_reply(&mut client, "+string\r\n").await;
+}
+
+#[tokio::test]
+async fn type_reports_none_once_a_key_has_expired() {
+    let addr = start_server().await;
+    let mut client = connect(addr).await;
+    // Set a key with a very short TTL, let it lapse, then TYPE sees 'none'.
+    send(
+        &mut client,
+        b"*5\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n$2\r\nPX\r\n$2\r\n20\r\n",
+    )
+    .await;
+    expect_reply(&mut client, "+OK\r\n").await;
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    send(&mut client, b"*2\r\n$4\r\nTYPE\r\n$1\r\nk\r\n").await;
+    expect_reply(&mut client, "+none\r\n").await;
+}
