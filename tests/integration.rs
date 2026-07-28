@@ -288,3 +288,92 @@ async fn type_reports_none_once_a_key_has_expired() {
     send(&mut client, b"*2\r\n$4\r\nTYPE\r\n$1\r\nk\r\n").await;
     expect_reply(&mut client, "+none\r\n").await;
 }
+
+#[tokio::test]
+async fn rpush_then_lrange_returns_the_list_in_order() {
+    let addr = start_server().await;
+    let mut client = connect(addr).await;
+    // RPUSH mylist a b c  -> length 3
+    send(
+        &mut client,
+        b"*5\r\n$5\r\nRPUSH\r\n$6\r\nmylist\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n",
+    )
+    .await;
+    expect_reply(&mut client, ":3\r\n").await;
+    // LRANGE mylist 0 -1  -> the whole list as an array of bulk strings.
+    send(
+        &mut client,
+        b"*4\r\n$6\r\nLRANGE\r\n$6\r\nmylist\r\n$1\r\n0\r\n$2\r\n-1\r\n",
+    )
+    .await;
+    expect_reply(&mut client, "*3\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n").await;
+    // LLEN reports the same count.
+    send(&mut client, b"*2\r\n$4\r\nLLEN\r\n$6\r\nmylist\r\n").await;
+    expect_reply(&mut client, ":3\r\n").await;
+    // TYPE now reports 'list'.
+    send(&mut client, b"*2\r\n$4\r\nTYPE\r\n$6\r\nmylist\r\n").await;
+    expect_reply(&mut client, "+list\r\n").await;
+}
+
+#[tokio::test]
+async fn lpush_prepends_and_pops_drain_from_both_ends() {
+    let addr = start_server().await;
+    let mut client = connect(addr).await;
+    // LPUSH q a b c -> pushed onto the head in turn, so the list is [c, b, a].
+    send(
+        &mut client,
+        b"*5\r\n$5\r\nLPUSH\r\n$1\r\nq\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n",
+    )
+    .await;
+    expect_reply(&mut client, ":3\r\n").await;
+    // LPOP takes the head 'c'...
+    send(&mut client, b"*2\r\n$4\r\nLPOP\r\n$1\r\nq\r\n").await;
+    expect_reply(&mut client, "$1\r\nc\r\n").await;
+    // ...RPOP takes the tail 'a'.
+    send(&mut client, b"*2\r\n$4\r\nRPOP\r\n$1\r\nq\r\n").await;
+    expect_reply(&mut client, "$1\r\na\r\n").await;
+    // Only 'b' remains.
+    send(
+        &mut client,
+        b"*4\r\n$6\r\nLRANGE\r\n$1\r\nq\r\n$1\r\n0\r\n$2\r\n-1\r\n",
+    )
+    .await;
+    expect_reply(&mut client, "*1\r\n$1\r\nb\r\n").await;
+}
+
+#[tokio::test]
+async fn popping_the_last_element_makes_the_key_disappear() {
+    let addr = start_server().await;
+    let mut client = connect(addr).await;
+    send(
+        &mut client,
+        b"*3\r\n$5\r\nRPUSH\r\n$1\r\nl\r\n$4\r\nonly\r\n",
+    )
+    .await;
+    expect_reply(&mut client, ":1\r\n").await;
+    send(&mut client, b"*2\r\n$4\r\nLPOP\r\n$1\r\nl\r\n").await;
+    expect_reply(&mut client, "$4\r\nonly\r\n").await;
+    // The list is empty, so the key is gone: LPOP is null and TYPE is none.
+    send(&mut client, b"*2\r\n$4\r\nLPOP\r\n$1\r\nl\r\n").await;
+    expect_reply(&mut client, "$-1\r\n").await;
+    send(&mut client, b"*2\r\n$4\r\nTYPE\r\n$1\r\nl\r\n").await;
+    expect_reply(&mut client, "+none\r\n").await;
+}
+
+#[tokio::test]
+async fn a_list_command_on_a_string_key_is_a_wrongtype_error() {
+    let addr = start_server().await;
+    let mut client = connect(addr).await;
+    // Store a string, then try to push to it as if it were a list.
+    send(&mut client, b"*3\r\n$3\r\nSET\r\n$1\r\ns\r\n$1\r\nv\r\n").await;
+    expect_reply(&mut client, "+OK\r\n").await;
+    send(&mut client, b"*3\r\n$5\r\nRPUSH\r\n$1\r\ns\r\n$1\r\nx\r\n").await;
+    expect_reply(
+        &mut client,
+        "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+    )
+    .await;
+    // The string survived the failed push unchanged.
+    send(&mut client, b"*2\r\n$3\r\nGET\r\n$1\r\ns\r\n").await;
+    expect_reply(&mut client, "$1\r\nv\r\n").await;
+}
