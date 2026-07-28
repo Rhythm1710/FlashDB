@@ -40,15 +40,35 @@ cargo build --release
 - `TTL key`
 - `PERSIST key`
 - `TYPE key`
+- `RPUSH key value [value ...]`
+- `LPUSH key value [value ...]`
+- `RPOP key`
+- `LPOP key`
+- `LLEN key`
+- `LRANGE key start stop`
 
 ## Value types
 
-Every key holds a typed value. Today the only type is `string`, but values are
-modelled as an enum so that lists, hashes, and sets can slot in without
-reworking the store — and so a command that meets the wrong type can reply with
-a `WRONGTYPE` error once more than one type exists. `TYPE key` reports the kind
-of value stored: `string` for a set key, or `none` if the key is missing or has
-expired.
+Every key holds a typed value — a `string` or a `list` today, with hashes and
+sets to follow. Values are modelled as an enum, so a command that meets the
+wrong type (say `GET` on a list, or `LPUSH` on a string) replies with a
+`WRONGTYPE` error instead of misbehaving. `TYPE key` reports the kind of value
+stored: `string`, `list`, or `none` if the key is missing or has expired.
+
+## Lists
+
+A list is an ordered sequence of strings you can grow and shrink from either
+end. `RPUSH` appends to the tail and `LPUSH` prepends to the head; both create
+the list on first use, accept several values at once, and return the list's new
+length. `RPOP` and `LPOP` remove and return one element from the tail or head
+(a null reply if the key is missing or empty) — and when a pop empties the
+list, the key is deleted, so an empty list never lingers.
+
+`LLEN key` returns the length (`0` for a missing key), and `LRANGE key start
+stop` returns the elements between `start` and `stop` inclusive. Indices are
+zero-based and may be negative to count back from the end, so `LRANGE mylist 0
+-1` returns the whole list; an inverted or out-of-range span yields an empty
+array rather than an error.
 
 ## Key expiry
 
