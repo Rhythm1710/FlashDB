@@ -377,3 +377,91 @@ async fn a_list_command_on_a_string_key_is_a_wrongtype_error() {
     send(&mut client, b"*2\r\n$3\r\nGET\r\n$1\r\ns\r\n").await;
     expect_reply(&mut client, "$1\r\nv\r\n").await;
 }
+
+#[tokio::test]
+async fn hset_then_hget_round_trips_fields_and_reports_hash() {
+    let addr = start_server().await;
+    let mut client = connect(addr).await;
+    // HSET h f1 v1 f2 v2 -> two new fields, so :2.
+    send(
+        &mut client,
+        b"*6\r\n$4\r\nHSET\r\n$1\r\nh\r\n$2\r\nf1\r\n$2\r\nv1\r\n$2\r\nf2\r\n$2\r\nv2\r\n",
+    )
+    .await;
+    expect_reply(&mut client, ":2\r\n").await;
+    // HGET reads a stored field back...
+    send(&mut client, b"*3\r\n$4\r\nHGET\r\n$1\r\nh\r\n$2\r\nf1\r\n").await;
+    expect_reply(&mut client, "$2\r\nv1\r\n").await;
+    // ...and a missing field on an existing hash is null.
+    send(
+        &mut client,
+        b"*3\r\n$4\r\nHGET\r\n$1\r\nh\r\n$4\r\nnope\r\n",
+    )
+    .await;
+    expect_reply(&mut client, "$-1\r\n").await;
+    // TYPE now reports 'hash'.
+    send(&mut client, b"*2\r\n$4\r\nTYPE\r\n$1\r\nh\r\n").await;
+    expect_reply(&mut client, "+hash\r\n").await;
+}
+
+#[tokio::test]
+async fn hgetall_returns_the_stored_pair() {
+    let addr = start_server().await;
+    let mut client = connect(addr).await;
+    // A single field/value pair keeps HGETALL's reply order deterministic
+    // (the HashMap order only matters once there is more than one pair).
+    send(
+        &mut client,
+        b"*4\r\n$4\r\nHSET\r\n$1\r\nh\r\n$5\r\nfield\r\n$5\r\nvalue\r\n",
+    )
+    .await;
+    expect_reply(&mut client, ":1\r\n").await;
+    send(&mut client, b"*2\r\n$7\r\nHGETALL\r\n$1\r\nh\r\n").await;
+    expect_reply(&mut client, "*2\r\n$5\r\nfield\r\n$5\r\nvalue\r\n").await;
+}
+
+#[tokio::test]
+async fn hdel_removes_fields_and_deletes_the_emptied_hash() {
+    let addr = start_server().await;
+    let mut client = connect(addr).await;
+    // HSET h a 1 b 2 -> :2
+    send(
+        &mut client,
+        b"*6\r\n$4\r\nHSET\r\n$1\r\nh\r\n$1\r\na\r\n$1\r\n1\r\n$1\r\nb\r\n$1\r\n2\r\n",
+    )
+    .await;
+    expect_reply(&mut client, ":2\r\n").await;
+    // Remove one field...
+    send(&mut client, b"*3\r\n$4\r\nHDEL\r\n$1\r\nh\r\n$1\r\na\r\n").await;
+    expect_reply(&mut client, ":1\r\n").await;
+    // ...then the last one, which empties and deletes the key.
+    send(&mut client, b"*3\r\n$4\r\nHDEL\r\n$1\r\nh\r\n$1\r\nb\r\n").await;
+    expect_reply(&mut client, ":1\r\n").await;
+    send(&mut client, b"*2\r\n$4\r\nTYPE\r\n$1\r\nh\r\n").await;
+    expect_reply(&mut client, "+none\r\n").await;
+    // HGETALL on the now-missing key is an empty array.
+    send(&mut client, b"*2\r\n$7\r\nHGETALL\r\n$1\r\nh\r\n").await;
+    expect_reply(&mut client, "*0\r\n").await;
+}
+
+#[tokio::test]
+async fn a_hash_command_on_a_string_key_is_a_wrongtype_error() {
+    let addr = start_server().await;
+    let mut client = connect(addr).await;
+    // Store a string, then try to HSET into it as if it were a hash.
+    send(&mut client, b"*3\r\n$3\r\nSET\r\n$1\r\ns\r\n$1\r\nv\r\n").await;
+    expect_reply(&mut client, "+OK\r\n").await;
+    send(
+        &mut client,
+        b"*4\r\n$4\r\nHSET\r\n$1\r\ns\r\n$1\r\nf\r\n$1\r\nv\r\n",
+    )
+    .await;
+    expect_reply(
+        &mut client,
+        "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+    )
+    .await;
+    // The string survived the failed HSET unchanged.
+    send(&mut client, b"*2\r\n$3\r\nGET\r\n$1\r\ns\r\n").await;
+    expect_reply(&mut client, "$1\r\nv\r\n").await;
+}
