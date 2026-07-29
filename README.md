@@ -46,14 +46,19 @@ cargo build --release
 - `LPOP key`
 - `LLEN key`
 - `LRANGE key start stop`
+- `HSET key field value [field value ...]`
+- `HGET key field`
+- `HGETALL key`
+- `HDEL key field [field ...]`
 
 ## Value types
 
-Every key holds a typed value — a `string` or a `list` today, with hashes and
+Every key holds a typed value — a `string`, a `list`, or a `hash` today, with
 sets to follow. Values are modelled as an enum, so a command that meets the
 wrong type (say `GET` on a list, or `LPUSH` on a string) replies with a
 `WRONGTYPE` error instead of misbehaving. `TYPE key` reports the kind of value
-stored: `string`, `list`, or `none` if the key is missing or has expired.
+stored: `string`, `list`, `hash`, or `none` if the key is missing or has
+expired.
 
 ## Lists
 
@@ -69,6 +74,22 @@ stop` returns the elements between `start` and `stop` inclusive. Indices are
 zero-based and may be negative to count back from the end, so `LRANGE mylist 0
 -1` returns the whole list; an inverted or out-of-range span yields an empty
 array rather than an error.
+
+## Hashes
+
+A hash maps string fields to string values under a single key — handy for
+representing an object without a key per attribute. `HSET key field value
+[field value ...]` sets one or more pairs (creating the hash on first use) and
+returns how many fields were *newly added*, so overwriting an existing field
+counts as zero. `HGET key field` returns a single field's value (a null reply
+if the field or key is missing), and `HGETALL key` returns every field and
+value flattened into one array. `HDEL key field [field ...]` removes fields and
+returns how many were actually present; when the last field is removed the key
+is deleted, so an empty hash never lingers.
+
+Fields are stored in a `HashMap`, so `HGETALL` returns pairs in an unspecified
+order — sort client-side if you need a stable order, exactly as you would with
+Redis.
 
 ## Key expiry
 
