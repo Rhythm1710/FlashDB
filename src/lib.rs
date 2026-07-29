@@ -98,6 +98,72 @@ fn expire_if_due(map: &mut HashMap<String, Entry>, key: &str, now: Instant) {
     }
 }
 
+/// Startup configuration parsed from the command-line arguments.
+///
+/// These mirror the Redis server flags FlashDB understands so far: `-p`/`--port`
+/// chooses the listening port, and `--dir` / `--dbfilename` name where an RDB
+/// snapshot lives on disk. The two RDB fields aren't consulted yet (persistence
+/// is Phase 3) but are parsed and held now so the wiring is ready the day
+/// `SAVE`/load arrive.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Config {
+    pub port: u16,
+    pub dir: String,
+    pub dbfilename: String,
+}
+
+impl Default for Config {
+    /// Redis's own defaults: port 6379, the current directory, `dump.rdb`.
+    fn default() -> Self {
+        Config {
+            port: 6379,
+            dir: ".".to_string(),
+            dbfilename: "dump.rdb".to_string(),
+        }
+    }
+}
+
+impl Config {
+    /// Parse configuration from an iterator of arguments — typically
+    /// `std::env::args().skip(1)`, i.e. the arguments *without* the program
+    /// name. Returns the built `Config`, or an `Err(message)` describing the
+    /// first problem (an unknown flag, or a flag with no value). Reporting the
+    /// error as a value rather than panicking lets `main` print a tidy message
+    /// and exit instead of aborting with a backtrace.
+    pub fn parse<I>(args: I) -> Result<Config, String>
+    where
+        I: IntoIterator<Item = String>,
+    {
+        let mut config = Config::default();
+        let mut it = args.into_iter();
+        while let Some(flag) = it.next() {
+            // A small closure to pull the value that must follow a flag,
+            // turning "ran off the end" into a readable error.
+            let value_for = |it: &mut I::IntoIter| {
+                it.next()
+                    .ok_or_else(|| format!("missing value for {flag} option"))
+            };
+            match flag.as_str() {
+                "-p" | "--port" => {
+                    let raw = value_for(&mut it)?;
+                    config.port = raw
+                        .parse::<u16>()
+                        .map_err(|_| format!("invalid port number '{raw}'"))?;
+                }
+                "--dir" => config.dir = value_for(&mut it)?,
+                "--dbfilename" => config.dbfilename = value_for(&mut it)?,
+                other => return Err(format!("unknown argument '{other}'")),
+            }
+        }
+        Ok(config)
+    }
+
+    /// The socket address the server should bind: `127.0.0.1:<port>`.
+    pub fn addr(&self) -> String {
+        format!("127.0.0.1:{}", self.port)
+    }
+}
+
 /// Accept connections on `listener` forever, serving each on its own task.
 ///
 /// The store is created here and shared (cloned `Arc`) into every connection.
@@ -1233,6 +1299,70 @@ mod tests {
         assert_eq!(
             hset(&[bulk("h"), bulk("field")], &s),
             Value::Error("ERR wrong number of arguments for 'hset' command".to_string())
+        );
+    }
+
+    // Build an owned argument list the way `std::env::args().skip(1)` would
+    // hand it to `Config::parse`.
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn config_defaults_when_no_args_are_given() {
+        let cfg = Config::parse(argv(&[])).unwrap();
+        assert_eq!(cfg, Config::default());
+        assert_eq!(cfg.port, 6379);
+        assert_eq!(cfg.dir, ".");
+        assert_eq!(cfg.dbfilename, "dump.rdb");
+        assert_eq!(cfg.addr(), "127.0.0.1:6379");
+    }
+
+    #[test]
+    fn config_parses_all_flags() {
+        let cfg = Config::parse(argv(&[
+            "-p",
+            "7000",
+            "--dir",
+            "/var/lib/flashdb",
+            "--dbfilename",
+            "snapshot.rdb",
+        ]))
+        .unwrap();
+        assert_eq!(cfg.port, 7000);
+        assert_eq!(cfg.dir, "/var/lib/flashdb");
+        assert_eq!(cfg.dbfilename, "snapshot.rdb");
+        assert_eq!(cfg.addr(), "127.0.0.1:7000");
+    }
+
+    #[test]
+    fn config_accepts_the_long_port_flag() {
+        let cfg = Config::parse(argv(&["--port", "6380"])).unwrap();
+        assert_eq!(cfg.port, 6380);
+    }
+
+    #[test]
+    fn config_rejects_unknown_flags() {
+        let err = Config::parse(argv(&["--nope", "1"])).unwrap_err();
+        assert_eq!(err, "unknown argument '--nope'");
+    }
+
+    #[test]
+    fn config_rejects_a_flag_with_no_value() {
+        let err = Config::parse(argv(&["-p"])).unwrap_err();
+        assert_eq!(err, "missing value for -p option");
+    }
+
+    #[test]
+    fn config_rejects_a_non_numeric_or_out_of_range_port() {
+        assert_eq!(
+            Config::parse(argv(&["-p", "abc"])).unwrap_err(),
+            "invalid port number 'abc'"
+        );
+        // 70000 doesn't fit in a u16, so it's rejected the same way.
+        assert_eq!(
+            Config::parse(argv(&["-p", "70000"])).unwrap_err(),
+            "invalid port number '70000'"
         );
     }
 }

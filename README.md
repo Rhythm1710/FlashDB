@@ -29,6 +29,20 @@ cargo build --release
 ./target/release/flashdb
 ```
 
+### Configuration
+
+The server accepts a few Redis-style startup flags:
+
+```sh
+flashdb -p 7000 --dir /var/lib/flashdb --dbfilename snapshot.rdb
+```
+
+`-p` (or `--port`) sets the listening port (default `6379`). `--dir` and
+`--dbfilename` name where an on-disk snapshot lives; they default to the
+current directory and `dump.rdb`, and are reserved for the upcoming RDB
+persistence work. An unknown flag or a flag missing its value prints a message
+and exits non-zero rather than starting.
+
 ## Implemented commands
 
 - `PING`
