@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
 
+pub mod rdb;
 pub mod resp;
 
 /// The typed payload a key holds.
@@ -25,6 +26,7 @@ pub mod resp;
 /// shape. `Str`, `List`, and `Hash` exist today; `Set` joins its variant as
 /// that command lands, at which point the accessors below grow the matching
 /// arms.
+#[derive(Debug, PartialEq)]
 pub enum StoredValue {
     Str(String),
     /// A list of strings held in a `VecDeque` so pushes and pops at *both*
