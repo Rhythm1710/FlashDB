@@ -4,7 +4,8 @@
 //! frames parse correctly in isolation, these prove the whole pipeline —
 //! accept, read, dispatch, reply — behaves against a live client.
 
-use std::time::Duration;
+use std::path::PathBuf;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -464,4 +465,129 @@ async fn a_hash_command_on_a_string_key_is_a_wrongtype_error() {
     // The string survived the failed HSET unchanged.
     send(&mut client, b"*2\r\n$3\r\nGET\r\n$1\r\ns\r\n").await;
     expect_reply(&mut client, "$1\r\nv\r\n").await;
+}
+
+// --- RDB snapshot loading on startup -------------------------------------
+
+/// Start a server that first loads an RDB snapshot from `dir/dbfilename`, the
+/// way `run_with_config` does at boot. The listener is bound here (so the OS
+/// picks the port) and the pre-loaded store is served on a background task.
+async fn start_server_with_rdb(dir: PathBuf, dbfilename: &str) -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let config = flashdb::Config {
+        port: 0, // unused: the listener is already bound
+        dir: dir.to_string_lossy().into_owned(),
+        dbfilename: dbfilename.to_string(),
+    };
+    tokio::spawn(async move {
+        let _ = flashdb::run_with_config(listener, &config).await;
+    });
+    addr
+}
+
+/// A fresh, uniquely-named temp directory for one test's snapshot file.
+fn temp_dir(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("flashdb-it-{}-{}", std::process::id(), tag));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// Hand-assemble a minimal valid RDB image: the `REDIS0011` header, a
+/// `SELECTDB 0`, one string record per pair (prefixed by an `EXPIRETIME_MS`
+/// opcode when a deadline is given), the `0xFF` end marker, and 8 zero bytes
+/// standing in for the CRC64 the loader doesn't verify. Keys and values must be
+/// shorter than 64 bytes so the length fits a single plain-length byte.
+fn build_rdb(pairs: &[(&str, &str, Option<u64>)]) -> Vec<u8> {
+    fn push_string(buf: &mut Vec<u8>, s: &str) {
+        buf.push(s.len() as u8);
+        buf.extend_from_slice(s.as_bytes());
+    }
+    let mut v = Vec::new();
+    v.extend_from_slice(b"REDIS0011");
+    v.push(0xFE);
+    v.push(0x00); // SELECTDB 0
+    for (key, value, expire_at_ms) in pairs {
+        if let Some(ms) = expire_at_ms {
+            v.push(0xFC);
+            v.extend_from_slice(&ms.to_le_bytes());
+        }
+        v.push(0x00); // string value type
+        push_string(&mut v, key);
+        push_string(&mut v, value);
+    }
+    v.push(0xFF);
+    v.extend_from_slice(&[0u8; 8]);
+    v
+}
+
+#[tokio::test]
+async fn loads_string_keys_from_an_rdb_on_startup() {
+    let dir = temp_dir("load-strings");
+    let rdb = build_rdb(&[
+        ("greeting", "hello world", None),
+        ("counter", "12345", None),
+    ]);
+    std::fs::write(dir.join("dump.rdb"), &rdb).unwrap();
+
+    let addr = start_server_with_rdb(dir, "dump.rdb").await;
+    let mut client = connect(addr).await;
+
+    // Both persisted keys are readable straight after boot.
+    send(&mut client, b"*2\r\n$3\r\nGET\r\n$8\r\ngreeting\r\n").await;
+    expect_reply(&mut client, "$11\r\nhello world\r\n").await;
+    send(&mut client, b"*2\r\n$3\r\nGET\r\n$7\r\ncounter\r\n").await;
+    expect_reply(&mut client, "$5\r\n12345\r\n").await;
+    // A key that was never in the snapshot is still absent.
+    send(&mut client, b"*2\r\n$3\r\nGET\r\n$4\r\nnope\r\n").await;
+    expect_reply(&mut client, "$-1\r\n").await;
+}
+
+#[tokio::test]
+async fn honours_expiry_metadata_when_loading() {
+    let dir = temp_dir("load-expiry");
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    // One deadline comfortably in the future, one already in the past.
+    let rdb = build_rdb(&[
+        ("lives", "still here", Some(now_ms + 1_000_000)),
+        ("dead", "gone", Some(now_ms - 1_000)),
+    ]);
+    std::fs::write(dir.join("dump.rdb"), &rdb).unwrap();
+
+    let addr = start_server_with_rdb(dir, "dump.rdb").await;
+    let mut client = connect(addr).await;
+
+    // The future-dated key loaded and is readable.
+    send(&mut client, b"*2\r\n$3\r\nGET\r\n$5\r\nlives\r\n").await;
+    expect_reply(&mut client, "$10\r\nstill here\r\n").await;
+    // ...and it kept its expiry: PERSIST finds a TTL to strip (:1), proving the
+    // absolute deadline was converted into a live one rather than dropped.
+    send(&mut client, b"*2\r\n$7\r\nPERSIST\r\n$5\r\nlives\r\n").await;
+    expect_reply(&mut client, ":1\r\n").await;
+    // The key whose deadline had already passed was discarded on load.
+    send(&mut client, b"*2\r\n$3\r\nGET\r\n$4\r\ndead\r\n").await;
+    expect_reply(&mut client, "$-1\r\n").await;
+}
+
+#[tokio::test]
+async fn a_missing_snapshot_starts_an_empty_but_working_server() {
+    let dir = temp_dir("no-snapshot");
+    // No dump.rdb written at all — a clean first boot.
+    let addr = start_server_with_rdb(dir, "dump.rdb").await;
+    let mut client = connect(addr).await;
+
+    // Nothing preloaded, but the server is fully functional.
+    send(&mut client, b"*2\r\n$3\r\nGET\r\n$3\r\nany\r\n").await;
+    expect_reply(&mut client, "$-1\r\n").await;
+    send(
+        &mut client,
+        b"*3\r\n$3\r\nSET\r\n$3\r\nnew\r\n$3\r\nval\r\n",
+    )
+    .await;
+    expect_reply(&mut client, "+OK\r\n").await;
+    send(&mut client, b"*2\r\n$3\r\nGET\r\n$3\r\nnew\r\n").await;
+    expect_reply(&mut client, "$3\r\nval\r\n").await;
 }

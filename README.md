@@ -38,10 +38,11 @@ flashdb -p 7000 --dir /var/lib/flashdb --dbfilename snapshot.rdb
 ```
 
 `-p` (or `--port`) sets the listening port (default `6379`). `--dir` and
-`--dbfilename` name where an on-disk snapshot lives; they default to the
-current directory and `dump.rdb`, and are reserved for the upcoming RDB
-persistence work. An unknown flag or a flag missing its value prints a message
-and exits non-zero rather than starting.
+`--dbfilename` name where the on-disk snapshot lives; they default to the
+current directory and `dump.rdb`, and are read at startup to load an existing
+snapshot (see [Persistence](#persistence-rdb-loading) below). An unknown flag or
+a flag missing its value prints a message and exits non-zero rather than
+starting.
 
 ## Implemented commands
 
@@ -117,6 +118,29 @@ Expiry is *passive*: a key past its deadline stays in memory until something
 touches it, at which point the read drops it and reports it as missing — so an
 expired key is indistinguishable from one that was never set.
 
+## Persistence (RDB loading)
+
+On startup FlashDB looks for a Redis RDB snapshot at `<dir>/<dbfilename>` and,
+if one is present, loads its keys into memory before accepting any clients — so
+a restart recovers whatever a previous run (or a real Redis server) persisted.
+Because FlashDB reads Redis's own binary format, a `dump.rdb` produced by
+`redis-server` loads directly:
+
+```sh
+redis-cli -p 6379 SET greeting "hello world"
+redis-cli -p 6379 SAVE            # writes dump.rdb
+# ...restart FlashDB pointing at that directory...
+redis-cli -p 6379 GET greeting    # "hello world" — recovered from disk
+```
+
+String values are understood today, including Redis's compact integer encoding
+(a numeric string is stored as an integer and rendered back to text on load).
+Each key's expiry metadata is honoured: a still-future deadline is restored as a
+live TTL, and a key whose deadline has already passed is dropped on load, just
+as Redis does. A missing snapshot is a clean first boot with an empty keyspace;
+a snapshot that can't be parsed aborts startup rather than silently discarding
+the data. Writing snapshots (`SAVE` / `BGSAVE`) is the next step.
+
 ## Protocol notes
 
 The RESP parser is incremental: a frame split across multiple TCP segments
@@ -127,9 +151,10 @@ Redis-style `-ERR Protocol error` reply before the connection is closed.
 ## Development
 
 The server logic lives in a library (`src/lib.rs`); `src/main.rs` is a thin
-binary that binds the listener and calls `flashdb::run`. Splitting it this way
-lets the integration tests start a real server on an ephemeral port and talk to
-it over a genuine TCP socket.
+binary that binds the listener and calls `flashdb::run_with_config` (which loads
+any RDB snapshot first). The RDB decoder lives in `src/rdb.rs`. Splitting it
+this way lets the integration tests start a real server on an ephemeral port and
+talk to it over a genuine TCP socket.
 
 ```sh
 cargo test              # parser unit tests + end-to-end integration tests
