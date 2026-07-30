@@ -9,7 +9,7 @@ use anyhow::Result;
 use resp::Value;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::{TcpListener, TcpStream};
 
 pub mod rdb;
@@ -166,14 +166,88 @@ impl Config {
     }
 }
 
+/// Load the RDB snapshot named by `config` (`<dir>/<dbfilename>`) into a fresh
+/// map of store entries.
+///
+/// A missing file is normal on a first run and yields an empty store rather
+/// than an error. A file that exists but can't be parsed *is* an error, so the
+/// caller can refuse to serve stale-or-corrupt data instead of silently
+/// starting empty.
+pub fn load_store_from_rdb(config: &Config) -> Result<HashMap<String, Entry>> {
+    let path = std::path::Path::new(&config.dir).join(&config.dbfilename);
+    let data = match std::fs::read(&path) {
+        Ok(data) => data,
+        // No snapshot yet — a clean first boot, not a failure.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let entries = rdb::parse_rdb(&data)?;
+    // Read both clocks once so every key in this load is converted against the
+    // same reference instant.
+    let now_unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    Ok(entries_to_store(entries, now_unix_ms, Instant::now()))
+}
+
+/// Turn parsed [`rdb::RdbEntry`]s into live [`Entry`]s, resolving expiry.
+///
+/// The RDB records each expiry as an *absolute wall-clock* deadline in Unix
+/// milliseconds, but the store measures expiry on the monotonic `Instant`
+/// clock, which has no fixed zero point. So we bridge the two clocks here: given
+/// the current wall-clock time (`now_unix_ms`) and the matching `now: Instant`,
+/// a key still in the future keeps `now + (deadline − now)`, while a key already
+/// past its deadline is dropped — exactly as Redis discards expired keys as it
+/// loads a snapshot. Taking both clocks as parameters keeps this logic
+/// deterministic and unit-testable without touching the real clock.
+fn entries_to_store(
+    entries: Vec<rdb::RdbEntry>,
+    now_unix_ms: u64,
+    now: Instant,
+) -> HashMap<String, Entry> {
+    let mut map = HashMap::new();
+    for entry in entries {
+        let expires_at = match entry.expire_at_ms {
+            None => None,
+            Some(deadline_ms) => {
+                if deadline_ms <= now_unix_ms {
+                    continue; // already expired at load time — don't resurrect it
+                }
+                Some(now + Duration::from_millis(deadline_ms - now_unix_ms))
+            }
+        };
+        map.insert(
+            entry.key,
+            Entry {
+                value: entry.value,
+                expires_at,
+            },
+        );
+    }
+    map
+}
+
 /// Accept connections on `listener` forever, serving each on its own task.
 ///
-/// The store is created here and shared (cloned `Arc`) into every connection.
-/// This never returns under normal operation; an error is only produced if
-/// `accept` itself fails.
+/// Starts from an empty keyspace. Use [`run_with_config`] to load an existing
+/// RDB snapshot first.
 pub async fn run(listener: TcpListener) -> Result<()> {
-    let storage: Store = Arc::new(Mutex::new(HashMap::new()));
+    serve(listener, Arc::new(Mutex::new(HashMap::new()))).await
+}
 
+/// Like [`run`], but first loads the RDB snapshot named by `config` so the
+/// server comes up carrying whatever a previous run persisted. A snapshot that
+/// fails to parse aborts startup rather than dropping the data.
+pub async fn run_with_config(listener: TcpListener, config: &Config) -> Result<()> {
+    let map = load_store_from_rdb(config)?;
+    serve(listener, Arc::new(Mutex::new(map))).await
+}
+
+/// The shared accept loop behind both entry points. The store is cloned (an
+/// `Arc` handle bump) into every connection task. This never returns under
+/// normal operation; an error is only produced if `accept` itself fails.
+async fn serve(listener: TcpListener, storage: Store) -> Result<()> {
     loop {
         let (stream, _) = listener.accept().await?;
         println!("accepted new connection");
@@ -1353,6 +1427,57 @@ mod tests {
     fn config_rejects_a_flag_with_no_value() {
         let err = Config::parse(argv(&["-p"])).unwrap_err();
         assert_eq!(err, "missing value for -p option");
+    }
+
+    fn rdb_entry(key: &str, val: &str, expire_at_ms: Option<u64>) -> rdb::RdbEntry {
+        rdb::RdbEntry {
+            key: key.to_string(),
+            value: StoredValue::Str(val.to_string()),
+            expire_at_ms,
+        }
+    }
+
+    #[test]
+    fn loading_keeps_unexpiring_keys_verbatim() {
+        let now = Instant::now();
+        let map = entries_to_store(vec![rdb_entry("k", "v", None)], 1_000, now);
+        let entry = map.get("k").expect("key should be loaded");
+        assert!(entry.expires_at.is_none());
+        match &entry.value {
+            StoredValue::Str(s) => assert_eq!(s, "v"),
+            other => panic!("expected a string, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn loading_drops_a_key_whose_deadline_already_passed() {
+        let now = Instant::now();
+        // Deadline 500ms, but "now" on the wall clock is already 1000ms.
+        let map = entries_to_store(vec![rdb_entry("stale", "v", Some(500))], 1_000, now);
+        assert!(!map.contains_key("stale"), "expired key must not load");
+    }
+
+    #[test]
+    fn loading_converts_a_future_deadline_into_a_live_ttl() {
+        let now = Instant::now();
+        // Deadline is 10s past the load moment on the wall clock.
+        let map = entries_to_store(vec![rdb_entry("k", "v", Some(10_000))], 0, now);
+        let entry = map.get("k").expect("future-dated key should load");
+        // Its Instant deadline should sit ~10s ahead of the reference instant,
+        // so TTL reads back as 10 seconds.
+        assert_eq!(entry.ttl_secs_at(now), Some(10));
+        assert!(!entry.is_expired_at(now));
+    }
+
+    #[test]
+    fn a_missing_rdb_file_loads_an_empty_store() {
+        let cfg = Config {
+            port: 6379,
+            dir: "/nonexistent-flashdb-dir".to_string(),
+            dbfilename: "nope.rdb".to_string(),
+        };
+        let map = load_store_from_rdb(&cfg).expect("a missing file is not an error");
+        assert!(map.is_empty());
     }
 
     #[test]

@@ -22,5 +22,7 @@ async fn main() -> Result<()> {
         "FlashDB listening on {addr} (dir: {}, dbfilename: {})",
         config.dir, config.dbfilename
     );
-    flashdb::run(listener).await
+    // Recover any keys a previous run persisted to <dir>/<dbfilename> before we
+    // start taking client traffic.
+    flashdb::run_with_config(listener, &config).await
 }
