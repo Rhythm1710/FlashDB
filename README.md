@@ -41,8 +41,10 @@ flashdb -p 7000 --dir /var/lib/flashdb --dbfilename snapshot.rdb
 `--dbfilename` name where the on-disk snapshot lives; they default to the
 current directory and `dump.rdb`; they locate the on-disk snapshot FlashDB loads
 at startup and writes on `SAVE` / `BGSAVE` (see [Persistence](#persistence-rdb)
-below). An unknown flag or a flag missing its value prints a message and exits
-non-zero rather than starting.
+below). `--replicaof <host> <port>` starts the server as a replica that syncs
+from a master on boot (see [Replication](#replication) below). An unknown flag or
+a flag missing its value prints a message and exits non-zero rather than
+starting.
 
 ## Implemented commands
 
@@ -159,6 +161,29 @@ redis-cli -p 6379 SAVE                 # FlashDB writes dump.rdb
 # ...point a real redis-server at that directory...
 redis-cli -p 6379 LRANGE mylist 0 -1   # 1) "a" 2) "b" 3) "c" — loaded by Redis
 ```
+
+## Replication
+
+FlashDB can start as a **replica** of another server and copy its keyspace on
+boot:
+
+```sh
+flashdb -p 6380 --replicaof 127.0.0.1 6379
+```
+
+On startup the replica dials the master and performs the Redis replication
+handshake — `PING`, two `REPLCONF` rounds (announcing its own listening port and
+its capabilities), then `PSYNC ? -1`. The master answers with a
+`+FULLRESYNC <replid> <offset>` line followed by a full RDB snapshot of its
+keyspace as a bulk payload. The replica frames that snapshot off the wire and
+loads it through the same RDB reader used for on-disk startup loading, so strings,
+lists, hashes, and expiry all transfer. The master can be another FlashDB
+instance or a real `redis-server`.
+
+The handshake runs on a background task, so the replica serves its own clients
+while it syncs; a failure to reach the master is logged and the replica keeps
+serving whatever it already had. Streaming the master's *ongoing* writes after
+the initial snapshot (the live replication link) is not implemented yet.
 
 ## Protocol notes
 

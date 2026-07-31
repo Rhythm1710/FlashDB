@@ -673,3 +673,113 @@ async fn bgsave_persists_in_the_background_and_reloads() {
     send(&mut reborn, b"*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n").await;
     expect_reply(&mut reborn, "$3\r\nval\r\n").await;
 }
+
+// --- Replication (replica side) ------------------------------------------
+
+/// Stand up a *mock master* that speaks just enough of the replication
+/// protocol for a replica to sync: it accepts one connection, answers the
+/// handshake (`+PONG`, `+OK`, `+OK`, `+FULLRESYNC ...`), then ships `rdb` as a
+/// bulk payload (`$<len>\r\n<bytes>`, no trailing CRLF, exactly as Redis does).
+///
+/// The replica sends each handshake command and waits for its reply before
+/// sending the next, so we read one command off the socket before each reply to
+/// stay in lock-step. Returns the master's address.
+async fn start_mock_master(rdb: Vec<u8>) -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut scratch = [0u8; 512];
+        // PING -> +PONG
+        let _ = sock.read(&mut scratch).await.unwrap();
+        sock.write_all(b"+PONG\r\n").await.unwrap();
+        // REPLCONF listening-port <port> -> +OK
+        let _ = sock.read(&mut scratch).await.unwrap();
+        sock.write_all(b"+OK\r\n").await.unwrap();
+        // REPLCONF capa psync2 -> +OK
+        let _ = sock.read(&mut scratch).await.unwrap();
+        sock.write_all(b"+OK\r\n").await.unwrap();
+        // PSYNC ? -1 -> +FULLRESYNC <replid> <offset>, then the bulk RDB.
+        let _ = sock.read(&mut scratch).await.unwrap();
+        sock.write_all(b"+FULLRESYNC 8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb 0\r\n")
+            .await
+            .unwrap();
+        sock.write_all(format!("${}\r\n", rdb.len()).as_bytes())
+            .await
+            .unwrap();
+        sock.write_all(&rdb).await.unwrap();
+        // Hold the link open briefly so the replica finishes reading the blob.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    });
+    addr
+}
+
+/// Start a replica pointed at `master_addr`, loading no local snapshot (empty
+/// temp dir), and return the address it serves its own clients on.
+async fn start_replica(master_addr: std::net::SocketAddr, tag: &str) -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let config = flashdb::Config {
+        port: addr.port(),
+        dir: temp_dir(tag).to_string_lossy().into_owned(),
+        dbfilename: "dump.rdb".to_string(),
+        replicaof: Some((master_addr.ip().to_string(), master_addr.port())),
+    };
+    tokio::spawn(async move {
+        let _ = flashdb::run_with_config(listener, &config).await;
+    });
+    addr
+}
+
+/// Poll `GET key` on the replica until it returns `want`, up to a bounded number
+/// of tries. Replication runs on a background task, so the key appears a moment
+/// after boot; this waits for it without a fixed sleep.
+async fn wait_for_get(client: &mut TcpStream, get_cmd: &[u8], want: &str, tries: usize) -> bool {
+    let mut chunk = [0u8; 256];
+    for _ in 0..tries {
+        send(client, get_cmd).await;
+        let n = tokio::time::timeout(Duration::from_secs(2), client.read(&mut chunk))
+            .await
+            .expect("timed out waiting for GET reply")
+            .expect("read failed");
+        if String::from_utf8_lossy(&chunk[..n]) == want {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    false
+}
+
+#[tokio::test]
+async fn replica_loads_the_masters_snapshot_over_the_wire() {
+    // The master's snapshot carries a plain key and a key with a live TTL.
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let rdb = build_rdb(&[
+        ("greeting", "hello", None),
+        ("temp", "soon", Some(now_ms + 1_000_000)),
+    ]);
+
+    let master_addr = start_mock_master(rdb).await;
+    let replica_addr = start_replica(master_addr, "replica-sync").await;
+    let mut client = connect(replica_addr).await;
+
+    // The replicated string appears on the replica after the sync completes.
+    let got = wait_for_get(
+        &mut client,
+        b"*2\r\n$3\r\nGET\r\n$8\r\ngreeting\r\n",
+        "$5\r\nhello\r\n",
+        40,
+    )
+    .await;
+    assert!(got, "replica never received the master's key");
+
+    // The TTL'd key transferred too, and kept its expiry: PERSIST finds a TTL to
+    // strip (:1), proving the absolute deadline survived the wire and load.
+    send(&mut client, b"*2\r\n$3\r\nGET\r\n$4\r\ntemp\r\n").await;
+    expect_reply(&mut client, "$4\r\nsoon\r\n").await;
+    send(&mut client, b"*2\r\n$7\r\nPERSIST\r\n$4\r\ntemp\r\n").await;
+    expect_reply(&mut client, ":1\r\n").await;
+}
