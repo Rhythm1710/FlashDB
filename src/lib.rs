@@ -14,6 +14,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::{TcpListener, TcpStream};
 
 pub mod rdb;
+pub mod replication;
 pub mod resp;
 
 /// The typed payload a key holds.
@@ -381,6 +382,26 @@ pub async fn run_with_config(listener: TcpListener, config: &Config) -> Result<(
     let map = load_store_from_rdb(config)?;
     let path = std::path::Path::new(&config.dir).join(&config.dbfilename);
     let server = Server::new(Arc::new(Mutex::new(map)), path);
+
+    // If we were told to replicate, kick off the sync in the background so the
+    // handshake with the master runs alongside — not before — us accepting our
+    // own clients. Replicated keys are merged into the shared store as they
+    // load; a sync failure is logged and the server keeps serving.
+    if let Some((host, master_port)) = &config.replicaof {
+        let master_addr = format!("{host}:{master_port}");
+        let listening_port = config.port;
+        let store = server.store.clone();
+        tokio::spawn(async move {
+            if let Err(e) =
+                replication::sync_from_master(&master_addr, listening_port, &store).await
+            {
+                eprintln!("Replication sync from {master_addr} failed: {e:?}");
+            } else {
+                println!("Replication: synced snapshot from master {master_addr}");
+            }
+        });
+    }
+
     serve(listener, server).await
 }
 
