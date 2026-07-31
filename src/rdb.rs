@@ -9,11 +9,13 @@
 //! an RDB file is built from — the *length encoding* and the *string encoding*
 //! — plus the byte cursor they read through. The upper one, [`parse_rdb`],
 //! walks the file's header and opcode stream and materialises each key into an
-//! [`RdbEntry`]. Only string values are understood so far (lists and hashes
-//! have their own richer encodings, added later); the loader turns the entries
-//! into live store entries.
+//! [`RdbEntry`]. Strings, lists, and hashes are understood in their classic
+//! (uncompressed) encodings; the loader turns the entries into live store
+//! entries. The inverse — writing an in-memory keyspace back out — lives in the
+//! [`write`] submodule, so a snapshot FlashDB saves loads straight back in.
 
 use crate::StoredValue;
+use std::collections::{HashMap, VecDeque};
 
 /// Everything that can go wrong while decoding an RDB file.
 ///
@@ -199,6 +201,8 @@ const OP_SELECTDB: u8 = 0xFE; // switch to database N for the records that follo
 const OP_EOF: u8 = 0xFF; // end of the keyspace; an 8-byte CRC64 follows
 
 const TYPE_STRING: u8 = 0; // a plain string value
+const TYPE_LIST: u8 = 1; // the classic list encoding: a count then that many strings
+const TYPE_HASH: u8 = 4; // the classic hash encoding: a count then that many field/value pairs
 
 /// Parse a whole RDB image into the entries it holds.
 ///
@@ -253,13 +257,209 @@ pub fn parse_rdb(data: &[u8]) -> Result<Vec<RdbEntry>, RdbError> {
     Ok(entries)
 }
 
-/// Decode a single value of the given RDB type. Only the string type exists in
-/// FlashDB's store today; every other type number is reported rather than
-/// misread, so an unsupported dump fails loudly instead of loading garbage.
+/// Decode a single value of the given RDB type. FlashDB understands the three
+/// value types its store can hold — string, list, and hash — in their classic
+/// uncompressed encodings. Any other type number (a modern listpack/quicklist,
+/// a set, a stream, …) is reported rather than misread, so an unsupported dump
+/// fails loudly instead of loading garbage.
 fn read_value(cur: &mut Cursor, value_type: u8) -> Result<StoredValue, RdbError> {
     match value_type {
         TYPE_STRING => Ok(StoredValue::Str(read_string(cur)?)),
+        // A list is a length followed by that many element strings.
+        TYPE_LIST => {
+            let count = read_count(cur)?;
+            let mut list = VecDeque::new();
+            for _ in 0..count {
+                list.push_back(read_string(cur)?);
+            }
+            Ok(StoredValue::List(list))
+        }
+        // A hash is a length followed by that many (field, value) string pairs.
+        TYPE_HASH => {
+            let count = read_count(cur)?;
+            let mut map = HashMap::new();
+            for _ in 0..count {
+                let field = read_string(cur)?;
+                let value = read_string(cur)?;
+                map.insert(field, value);
+            }
+            Ok(StoredValue::Hash(map))
+        }
         other => Err(RdbError::UnsupportedValueType(other)),
+    }
+}
+
+/// Read a length that must be a plain byte count, not one of the `11`-flagged
+/// "special" encodings — the element/field count in front of a list or hash.
+/// A special encoding here means a corrupt file, so it's an error rather than a
+/// silent misread. We don't pre-size collections from this count: a corrupt
+/// huge value would otherwise trigger a giant allocation before the reads that
+/// would fail anyway run out of bytes.
+fn read_count(cur: &mut Cursor) -> Result<u64, RdbError> {
+    match read_length(cur)? {
+        Length::Plain(n) => Ok(n),
+        Length::Special(_) => Err(RdbError::UnsupportedLengthEncoding),
+    }
+}
+
+/// Writing the RDB format — the inverse of the decoders above.
+///
+/// [`serialize`] turns a slice of [`RdbEntry`]s into the exact byte image a
+/// `dump.rdb` file holds: the `REDIS` header, a single database, one typed
+/// record per key (each optionally preceded by its expiry), the `0xFF` end
+/// marker, and the CRC64 trailer Redis checks on load. The length and string
+/// encoders mirror [`read_length`] / [`read_string`], so a snapshot FlashDB
+/// writes loads straight back through [`parse_rdb`] — and, because the checksum
+/// is Redis's own CRC64 variant, into a real `redis-server` too.
+pub mod write {
+    use super::{
+        RdbEntry, OP_EOF, OP_EXPIRETIME_MS, OP_SELECTDB, TYPE_HASH, TYPE_LIST, TYPE_STRING,
+    };
+    use crate::StoredValue;
+
+    /// The version stamped after the `REDIS` magic. We emit v6 — deliberately
+    /// conservative. A reader refuses a file whose version exceeds the newest it
+    /// knows, so a low version keeps snapshots loadable by the widest range of
+    /// Redis releases (and by FlashDB, whose loader accepts any 4-digit
+    /// version). We only use ancient opcodes and the classic string/list/hash
+    /// encodings, all valid since the earliest RDB versions, so nothing here
+    /// needs a newer version to be understood.
+    const RDB_VERSION: &[u8] = b"0006";
+
+    /// Append `n` in RDB's variable-length integer encoding — the inverse of
+    /// [`super::read_length`]. The width follows the magnitude: 6 bits for
+    /// values below 64 (one byte), 14 bits below 16384 (two bytes), otherwise a
+    /// 32- or 64-bit big-endian length behind a `0x80` / `0x81` flag byte. We
+    /// never emit the `11`-flagged "special" forms, so every length we write is
+    /// a plain byte count a reader takes at face value.
+    pub fn write_length(buf: &mut Vec<u8>, n: u64) {
+        if n < 1 << 6 {
+            // 00xxxxxx — the value is the low six bits of a single byte.
+            buf.push(n as u8);
+        } else if n < 1 << 14 {
+            // 01xxxxxx xxxxxxxx — 14 bits, high six in this byte, low eight next.
+            buf.push(0b0100_0000 | (n >> 8) as u8);
+            buf.push(n as u8);
+        } else if n <= u32::MAX as u64 {
+            // 0x80 then a 32-bit big-endian length.
+            buf.push(0x80);
+            buf.extend_from_slice(&(n as u32).to_be_bytes());
+        } else {
+            // 0x81 then a 64-bit big-endian length.
+            buf.push(0x81);
+            buf.extend_from_slice(&n.to_be_bytes());
+        }
+    }
+
+    /// Append a string as a length prefix then its raw UTF-8 bytes — the inverse
+    /// of [`super::read_string`]'s plain form. We always write the plain form
+    /// (never the compact integer encoding); that's valid RDB every reader
+    /// accepts, and the integer packing is a size optimisation, not a
+    /// correctness requirement.
+    pub fn write_string(buf: &mut Vec<u8>, s: &str) {
+        write_length(buf, s.len() as u64);
+        buf.extend_from_slice(s.as_bytes());
+    }
+
+    /// The one-byte type tag that introduces a value's record.
+    fn value_type_tag(value: &StoredValue) -> u8 {
+        match value {
+            StoredValue::Str(_) => TYPE_STRING,
+            StoredValue::List(_) => TYPE_LIST,
+            StoredValue::Hash(_) => TYPE_HASH,
+        }
+    }
+
+    /// Append a value's payload (everything after its type tag), in the same
+    /// classic encoding [`super::read_value`] reads back: a string is one
+    /// string; a list is a count then its elements; a hash is a count then its
+    /// field/value string pairs.
+    fn write_payload(buf: &mut Vec<u8>, value: &StoredValue) {
+        match value {
+            StoredValue::Str(s) => write_string(buf, s),
+            StoredValue::List(list) => {
+                write_length(buf, list.len() as u64);
+                for item in list {
+                    write_string(buf, item);
+                }
+            }
+            StoredValue::Hash(map) => {
+                write_length(buf, map.len() as u64);
+                for (field, value) in map {
+                    write_string(buf, field);
+                    write_string(buf, value);
+                }
+            }
+        }
+    }
+
+    /// Serialize a whole keyspace into the RDB byte image.
+    ///
+    /// Layout: `REDIS` + version, a single `SELECTDB 0`, then for each entry an
+    /// optional `EXPIRETIME_MS` opcode carrying its absolute millisecond
+    /// deadline followed by the `<type><key><payload>` record, then the `0xFF`
+    /// end marker, and finally the 8-byte little-endian CRC64 of everything
+    /// written before it. Feeding the result back to [`parse_rdb`] returns the
+    /// same entries.
+    pub fn serialize(entries: &[RdbEntry]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"REDIS");
+        buf.extend_from_slice(RDB_VERSION);
+
+        // A single database, number 0.
+        buf.push(OP_SELECTDB);
+        write_length(&mut buf, 0);
+
+        for entry in entries {
+            if let Some(deadline_ms) = entry.expire_at_ms {
+                buf.push(OP_EXPIRETIME_MS);
+                buf.extend_from_slice(&deadline_ms.to_le_bytes());
+            }
+            // Record order matches the reader: type tag, then key, then value.
+            buf.push(value_type_tag(&entry.value));
+            write_string(&mut buf, &entry.key);
+            write_payload(&mut buf, &entry.value);
+        }
+
+        buf.push(OP_EOF);
+        // The checksum covers the whole image up to and including the EOF byte.
+        let checksum = crc64(0, &buf);
+        buf.extend_from_slice(&checksum.to_le_bytes());
+        buf
+    }
+
+    /// CRC64 as Redis computes it — the Jones polynomial with reflected input
+    /// and output (`poly 0xad93d23594c935a9`, init 0, no final xor). Matching
+    /// Redis bit-for-bit is what lets a real `redis-server` accept a snapshot
+    /// FlashDB wrote; a wrong checksum would be rejected as a corrupt file.
+    pub(crate) fn crc64(mut crc: u64, data: &[u8]) -> u64 {
+        const POLY: u64 = 0xad93d23594c935a9;
+        for &byte in data {
+            // Reflected input: fold in the byte's bits low-to-high.
+            for i in 0..8 {
+                let mut bit = (crc & 0x8000_0000_0000_0000) != 0;
+                if byte & (1 << i) != 0 {
+                    bit = !bit;
+                }
+                crc <<= 1;
+                if bit {
+                    crc ^= POLY;
+                }
+            }
+        }
+        // Reflected output: mirror the 64-bit register end for end.
+        crc_reflect(crc)
+    }
+
+    /// Reverse the order of all 64 bits — the output reflection CRC-64/Jones
+    /// applies to the final register.
+    fn crc_reflect(mut data: u64) -> u64 {
+        let mut ret = data & 1;
+        for _ in 1..64 {
+            data >>= 1;
+            ret = (ret << 1) | (data & 1);
+        }
+        ret
     }
 }
 
@@ -426,12 +626,14 @@ mod tests {
     }
 
     #[test]
-    fn a_non_string_value_type_is_reported_not_misread() {
+    fn an_unsupported_value_type_is_reported_not_misread() {
         let mut v = Vec::new();
         v.extend_from_slice(b"REDIS0011");
-        v.push(0x01); // list type — not supported yet
+        // Type 0x02 is a set — a value type FlashDB's store can't hold yet, so
+        // it must be reported rather than misread as something it understands.
+        v.push(0x02);
         v.extend_from_slice(&[0x01, b'k']);
-        assert_eq!(parse_rdb(&v), Err(RdbError::UnsupportedValueType(0x01)));
+        assert_eq!(parse_rdb(&v), Err(RdbError::UnsupportedValueType(0x02)));
     }
 
     // A real snapshot produced by `redis-server` 7.0.15 via `SAVE`, captured
@@ -477,5 +679,129 @@ mod tests {
         assert!(by_key("temp").expire_at_ms.is_some());
         assert_eq!(by_key("greeting").expire_at_ms, None);
         assert_eq!(entries.len(), 5);
+    }
+
+    // --- Writing (the `write` submodule) ---------------------------------
+
+    use super::write;
+
+    // Every length we write must read back as the same plain byte count, across
+    // the 1-, 2-, 5-, and 9-byte width boundaries the encoder switches on.
+    #[test]
+    fn written_lengths_round_trip_through_the_reader() {
+        for &n in &[
+            0u64,
+            1,
+            63,
+            64,
+            255,
+            16_383,
+            16_384,
+            70_000,
+            u32::MAX as u64,
+            1 << 40,
+        ] {
+            let mut buf = Vec::new();
+            write::write_length(&mut buf, n);
+            let mut cur = Cursor::new(&buf);
+            assert_eq!(read_length(&mut cur).unwrap(), Length::Plain(n), "n = {n}");
+        }
+    }
+
+    // The width boundaries produce the byte counts we expect: 6-bit → 1 byte,
+    // 14-bit → 2, 32-bit → 5, 64-bit → 9.
+    #[test]
+    fn length_encoding_uses_the_smallest_width() {
+        let sizes = |n| {
+            let mut b = Vec::new();
+            write::write_length(&mut b, n);
+            b.len()
+        };
+        assert_eq!(sizes(63), 1);
+        assert_eq!(sizes(64), 2);
+        assert_eq!(sizes(16_383), 2);
+        assert_eq!(sizes(16_384), 5);
+        assert_eq!(sizes(u32::MAX as u64), 5);
+        assert_eq!(sizes(1 << 40), 9);
+    }
+
+    #[test]
+    fn written_strings_round_trip_through_the_reader() {
+        for s in ["", "a", "hello world", &"x".repeat(300)] {
+            let mut buf = Vec::new();
+            write::write_string(&mut buf, s);
+            let mut cur = Cursor::new(&buf);
+            assert_eq!(read_string(&mut cur).unwrap(), s);
+        }
+    }
+
+    // The canonical CRC-64/Jones check value, plus Redis's documented one.
+    #[test]
+    fn crc64_matches_the_canonical_check_value() {
+        assert_eq!(write::crc64(0, b"123456789"), 0xe9c6d914c4b8d9ca);
+    }
+
+    // The strongest proof our checksum is Redis-correct: recompute the CRC over
+    // the real 7.0.15 snapshot's body and match the 8 bytes Redis itself wrote.
+    #[test]
+    fn crc64_reproduces_a_real_redis_snapshots_trailer() {
+        let n = REDIS_7_GOLDEN.len();
+        let stored = u64::from_le_bytes(REDIS_7_GOLDEN[n - 8..].try_into().unwrap());
+        assert_eq!(write::crc64(0, &REDIS_7_GOLDEN[..n - 8]), stored);
+    }
+
+    // A serialize → parse_rdb round-trip for every value type, an expiry, and an
+    // empty string — the whole shape a snapshot has to survive.
+    #[test]
+    fn serialize_then_parse_round_trips_every_value_type() {
+        let mut list = VecDeque::new();
+        list.push_back("a".to_string());
+        list.push_back("b".to_string());
+        let mut hash = HashMap::new();
+        hash.insert("field".to_string(), "value".to_string());
+
+        let input = vec![
+            RdbEntry {
+                key: "s".to_string(),
+                value: StoredValue::Str("hello".to_string()),
+                expire_at_ms: None,
+            },
+            RdbEntry {
+                key: "empty".to_string(),
+                value: StoredValue::Str("".to_string()),
+                expire_at_ms: None,
+            },
+            RdbEntry {
+                key: "temp".to_string(),
+                value: StoredValue::Str("v".to_string()),
+                expire_at_ms: Some(1_700_000_000_000),
+            },
+            RdbEntry {
+                key: "l".to_string(),
+                value: StoredValue::List(list),
+                expire_at_ms: None,
+            },
+            RdbEntry {
+                key: "h".to_string(),
+                value: StoredValue::Hash(hash),
+                expire_at_ms: None,
+            },
+        ];
+
+        let bytes = write::serialize(&input);
+        let mut got = parse_rdb(&bytes).unwrap();
+        // Order isn't guaranteed to match; sort both sides by key to compare.
+        got.sort_by(|a, b| a.key.cmp(&b.key));
+        let mut want = input;
+        want.sort_by(|a, b| a.key.cmp(&b.key));
+        assert_eq!(got, want);
+    }
+
+    // An empty keyspace still produces a valid, checksummed, loadable image.
+    #[test]
+    fn serialize_of_an_empty_keyspace_is_valid_and_empty() {
+        let bytes = write::serialize(&[]);
+        assert!(bytes.starts_with(b"REDIS"));
+        assert_eq!(parse_rdb(&bytes).unwrap(), vec![]);
     }
 }
