@@ -591,3 +591,84 @@ async fn a_missing_snapshot_starts_an_empty_but_working_server() {
     send(&mut client, b"*2\r\n$3\r\nGET\r\n$3\r\nnew\r\n").await;
     expect_reply(&mut client, "$3\r\nval\r\n").await;
 }
+
+// --- RDB snapshot saving (SAVE / BGSAVE) ---------------------------------
+
+#[tokio::test]
+async fn save_writes_a_snapshot_a_fresh_server_reloads() {
+    let dir = temp_dir("save-reload");
+    let addr = start_server_with_rdb(dir.clone(), "dump.rdb").await;
+    let mut client = connect(addr).await;
+
+    // Populate one of each value type: a string, a list, and a hash.
+    send(
+        &mut client,
+        b"*3\r\n$3\r\nSET\r\n$8\r\ngreeting\r\n$11\r\nhello world\r\n",
+    )
+    .await;
+    expect_reply(&mut client, "+OK\r\n").await;
+    send(
+        &mut client,
+        b"*4\r\n$5\r\nRPUSH\r\n$1\r\nl\r\n$1\r\na\r\n$1\r\nb\r\n",
+    )
+    .await;
+    expect_reply(&mut client, ":2\r\n").await;
+    send(
+        &mut client,
+        b"*4\r\n$4\r\nHSET\r\n$1\r\nh\r\n$1\r\nf\r\n$1\r\nv\r\n",
+    )
+    .await;
+    expect_reply(&mut client, ":1\r\n").await;
+
+    // SAVE persists synchronously and replies +OK.
+    send(&mut client, b"*1\r\n$4\r\nSAVE\r\n").await;
+    expect_reply(&mut client, "+OK\r\n").await;
+
+    // A brand-new server booting against the same directory recovers all three
+    // keys with their contents — the full save → load round trip over the wire.
+    let addr2 = start_server_with_rdb(dir, "dump.rdb").await;
+    let mut reborn = connect(addr2).await;
+    send(&mut reborn, b"*2\r\n$3\r\nGET\r\n$8\r\ngreeting\r\n").await;
+    expect_reply(&mut reborn, "$11\r\nhello world\r\n").await;
+    send(
+        &mut reborn,
+        b"*4\r\n$6\r\nLRANGE\r\n$1\r\nl\r\n$1\r\n0\r\n$2\r\n-1\r\n",
+    )
+    .await;
+    expect_reply(&mut reborn, "*2\r\n$1\r\na\r\n$1\r\nb\r\n").await;
+    send(&mut reborn, b"*3\r\n$4\r\nHGET\r\n$1\r\nh\r\n$1\r\nf\r\n").await;
+    expect_reply(&mut reborn, "$1\r\nv\r\n").await;
+}
+
+#[tokio::test]
+async fn bgsave_persists_in_the_background_and_reloads() {
+    let dir = temp_dir("bgsave");
+    let addr = start_server_with_rdb(dir.clone(), "dump.rdb").await;
+    let mut client = connect(addr).await;
+
+    send(
+        &mut client,
+        b"*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$3\r\nval\r\n",
+    )
+    .await;
+    expect_reply(&mut client, "+OK\r\n").await;
+    // BGSAVE returns immediately, before the file is necessarily on disk.
+    send(&mut client, b"*1\r\n$6\r\nBGSAVE\r\n").await;
+    expect_reply(&mut client, "+Background saving started\r\n").await;
+
+    // The background write is atomic (temp file then rename), so the snapshot
+    // path appears only once it's complete. Wait for it, bounded, then reload.
+    let path = dir.join("dump.rdb");
+    for _ in 0..100 {
+        if path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(path.exists(), "BGSAVE never wrote the snapshot");
+
+    let addr2 = start_server_with_rdb(dir, "dump.rdb").await;
+    let mut reborn = connect(addr2).await;
+    send(&mut reborn, b"*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n").await;
+    expect_reply(&mut reborn, "$3\r\nval\r\n").await;
+}

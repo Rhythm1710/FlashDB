@@ -39,10 +39,10 @@ flashdb -p 7000 --dir /var/lib/flashdb --dbfilename snapshot.rdb
 
 `-p` (or `--port`) sets the listening port (default `6379`). `--dir` and
 `--dbfilename` name where the on-disk snapshot lives; they default to the
-current directory and `dump.rdb`, and are read at startup to load an existing
-snapshot (see [Persistence](#persistence-rdb-loading) below). An unknown flag or
-a flag missing its value prints a message and exits non-zero rather than
-starting.
+current directory and `dump.rdb`; they locate the on-disk snapshot FlashDB loads
+at startup and writes on `SAVE` / `BGSAVE` (see [Persistence](#persistence-rdb)
+below). An unknown flag or a flag missing its value prints a message and exits
+non-zero rather than starting.
 
 ## Implemented commands
 
@@ -65,6 +65,8 @@ starting.
 - `HGET key field`
 - `HGETALL key`
 - `HDEL key field [field ...]`
+- `SAVE`
+- `BGSAVE`
 
 ## Value types
 
@@ -118,28 +120,45 @@ Expiry is *passive*: a key past its deadline stays in memory until something
 touches it, at which point the read drops it and reports it as missing — so an
 expired key is indistinguishable from one that was never set.
 
-## Persistence (RDB loading)
+## Persistence (RDB)
+
+FlashDB persists to disk in Redis's own binary RDB format, so snapshots move
+freely in both directions between FlashDB and a real `redis-server`.
+
+### Loading
 
 On startup FlashDB looks for a Redis RDB snapshot at `<dir>/<dbfilename>` and,
 if one is present, loads its keys into memory before accepting any clients — so
-a restart recovers whatever a previous run (or a real Redis server) persisted.
-Because FlashDB reads Redis's own binary format, a `dump.rdb` produced by
-`redis-server` loads directly:
+a restart recovers whatever a previous run (or a real Redis server) persisted. A
+missing snapshot is a clean first boot with an empty keyspace; a snapshot that
+can't be parsed aborts startup rather than silently discarding the data.
+
+Redis's compact integer string encoding is understood on load (a numeric string
+is stored as an integer and rendered back to text). Each key's expiry metadata
+is honoured: a still-future deadline is restored as a live TTL, and a key whose
+deadline has already passed is dropped on load, just as Redis does.
+
+### Saving
+
+`SAVE` writes the whole keyspace to `<dir>/<dbfilename>` synchronously and
+replies `+OK` once the file is on disk. `BGSAVE` takes a consistent snapshot and
+hands the file write to a background thread, replying `+Background saving
+started` immediately so the client isn't blocked on the disk (real Redis forks a
+child process for the same effect). Both write the file atomically — to a temp
+file, then a rename — so a crash mid-write never leaves a half-written snapshot.
+
+Strings, lists, and hashes are all serialized, each with its optional expiry.
+Because the on-disk bytes are real RDB — right down to the CRC64 trailer Redis
+verifies on load — a snapshot FlashDB writes loads straight back into FlashDB
+*and* into an unmodified `redis-server`:
 
 ```sh
 redis-cli -p 6379 SET greeting "hello world"
-redis-cli -p 6379 SAVE            # writes dump.rdb
-# ...restart FlashDB pointing at that directory...
-redis-cli -p 6379 GET greeting    # "hello world" — recovered from disk
+redis-cli -p 6379 RPUSH mylist a b c
+redis-cli -p 6379 SAVE                 # FlashDB writes dump.rdb
+# ...point a real redis-server at that directory...
+redis-cli -p 6379 LRANGE mylist 0 -1   # 1) "a" 2) "b" 3) "c" — loaded by Redis
 ```
-
-String values are understood today, including Redis's compact integer encoding
-(a numeric string is stored as an integer and rendered back to text on load).
-Each key's expiry metadata is honoured: a still-future deadline is restored as a
-live TTL, and a key whose deadline has already passed is dropped on load, just
-as Redis does. A missing snapshot is a clean first boot with an empty keyspace;
-a snapshot that can't be parsed aborts startup rather than silently discarding
-the data. Writing snapshots (`SAVE` / `BGSAVE`) is the next step.
 
 ## Protocol notes
 
