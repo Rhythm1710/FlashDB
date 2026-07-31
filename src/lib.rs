@@ -8,6 +8,7 @@
 use anyhow::Result;
 use resp::Value;
 use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::{TcpListener, TcpStream};
@@ -26,7 +27,7 @@ pub mod resp;
 /// shape. `Str`, `List`, and `Hash` exist today; `Set` joins its variant as
 /// that command lands, at which point the accessors below grow the matching
 /// arms.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum StoredValue {
     Str(String),
     /// A list of strings held in a `VecDeque` so pushes and pops at *both*
@@ -184,11 +185,7 @@ pub fn load_store_from_rdb(config: &Config) -> Result<HashMap<String, Entry>> {
     let entries = rdb::parse_rdb(&data)?;
     // Read both clocks once so every key in this load is converted against the
     // same reference instant.
-    let now_unix_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    Ok(entries_to_store(entries, now_unix_ms, Instant::now()))
+    Ok(entries_to_store(entries, now_unix_ms(), Instant::now()))
 }
 
 /// Turn parsed [`rdb::RdbEntry`]s into live [`Entry`]s, resolving expiry.
@@ -228,39 +225,166 @@ fn entries_to_store(
     map
 }
 
+/// The current wall-clock time in Unix milliseconds (0 in the impossible case
+/// the clock reads before the epoch). Both the loader and the saver take a
+/// single reading of this so every key in one operation shares one reference.
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Turn the live store into the [`rdb::RdbEntry`]s a snapshot serializes — the
+/// inverse of [`entries_to_store`]. Each value is cloned (the snapshot must
+/// outlive the lock), already-expired keys are skipped so dead keys aren't
+/// persisted, and every surviving expiry is converted from the store's monotonic
+/// `Instant` deadline back into the absolute Unix-millisecond deadline the file
+/// records. Both clocks are parameters, so the conversion stays deterministic
+/// and unit-testable without touching the real clock.
+fn map_to_rdb_entries(
+    map: &HashMap<String, Entry>,
+    now_unix_ms: u64,
+    now: Instant,
+) -> Vec<rdb::RdbEntry> {
+    let mut entries = Vec::with_capacity(map.len());
+    for (key, entry) in map {
+        if entry.is_expired_at(now) {
+            continue; // a key that has already lapsed is not worth persisting
+        }
+        let expire_at_ms = entry.expires_at.map(|deadline| {
+            // How far the deadline sits ahead of `now` on the monotonic clock,
+            // laid back onto the wall clock to get an absolute deadline.
+            let remaining = deadline.saturating_duration_since(now);
+            now_unix_ms + remaining.as_millis() as u64
+        });
+        entries.push(rdb::RdbEntry {
+            key: key.clone(),
+            value: entry.value.clone(),
+            expire_at_ms,
+        });
+    }
+    entries
+}
+
+/// Take a consistent snapshot of the store and serialize it to the RDB byte
+/// image. The lock is held only long enough to copy the keyspace into owned
+/// entries; the encoding runs after the lock is released, so a snapshot doesn't
+/// block other clients for the whole serialization.
+fn snapshot_bytes(store: &Store) -> Vec<u8> {
+    let now = Instant::now();
+    let unix_ms = now_unix_ms();
+    let entries = {
+        let map = store.lock().unwrap();
+        map_to_rdb_entries(&map, unix_ms, now)
+    };
+    rdb::write::serialize(&entries)
+}
+
+/// Write `bytes` to `path` atomically: write a sibling temp file, then rename it
+/// over the target. A crash mid-write leaves the previous snapshot intact rather
+/// than a half-written file, the same trick Redis uses with its temp file.
+fn write_snapshot(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)
+}
+
+/// `SAVE` — synchronously write the whole keyspace to the configured RDB path,
+/// then reply `+OK`. Like Redis's own `SAVE`, this blocks until the file is on
+/// disk. An IO failure becomes an error reply rather than a crash.
+fn save(args: &[Value], server: &Server) -> Value {
+    if !args.is_empty() {
+        return wrong_args("save");
+    }
+    let bytes = snapshot_bytes(&server.store);
+    match write_snapshot(server.rdb_path.as_path(), &bytes) {
+        Ok(()) => Value::SimpleString("OK".to_string()),
+        Err(e) => Value::Error(format!("ERR {}", e)),
+    }
+}
+
+/// `BGSAVE` — snapshot the keyspace and write it off the request path. We copy a
+/// consistent point-in-time snapshot under the lock (Redis forks a child for the
+/// same effect), then hand the file IO to a background thread and reply at once
+/// so the client isn't blocked on the disk. A write failure is logged rather
+/// than reported, since the reply has already gone out.
+fn bgsave(args: &[Value], server: &Server) -> Value {
+    if !args.is_empty() {
+        return wrong_args("bgsave");
+    }
+    let bytes = snapshot_bytes(&server.store);
+    let path = server.rdb_path.clone();
+    std::thread::spawn(move || {
+        if let Err(e) = write_snapshot(path.as_path(), &bytes) {
+            eprintln!("Background save failed: {e}");
+        }
+    });
+    Value::SimpleString("Background saving started".to_string())
+}
+
+/// The shared runtime state every connection task holds: the keyspace, plus the
+/// path `SAVE` / `BGSAVE` persist it to. Cloning a `Server` is cheap — the store
+/// is an `Arc` handle and the path sits behind an `Arc` — so each connection
+/// gets its own handle to the same state.
+#[derive(Clone)]
+pub struct Server {
+    store: Store,
+    rdb_path: Arc<PathBuf>,
+}
+
+impl Server {
+    fn new(store: Store, rdb_path: PathBuf) -> Self {
+        Server {
+            store,
+            rdb_path: Arc::new(rdb_path),
+        }
+    }
+}
+
 /// Accept connections on `listener` forever, serving each on its own task.
 ///
-/// Starts from an empty keyspace. Use [`run_with_config`] to load an existing
-/// RDB snapshot first.
+/// Starts from an empty keyspace, persisting to `dump.rdb` in the working
+/// directory. Use [`run_with_config`] to load an existing RDB snapshot first and
+/// control where snapshots are written.
 pub async fn run(listener: TcpListener) -> Result<()> {
-    serve(listener, Arc::new(Mutex::new(HashMap::new()))).await
+    let server = Server::new(
+        Arc::new(Mutex::new(HashMap::new())),
+        PathBuf::from("dump.rdb"),
+    );
+    serve(listener, server).await
 }
 
 /// Like [`run`], but first loads the RDB snapshot named by `config` so the
-/// server comes up carrying whatever a previous run persisted. A snapshot that
+/// server comes up carrying whatever a previous run persisted, and directs
+/// `SAVE` / `BGSAVE` back to that same `<dir>/<dbfilename>`. A snapshot that
 /// fails to parse aborts startup rather than dropping the data.
 pub async fn run_with_config(listener: TcpListener, config: &Config) -> Result<()> {
     let map = load_store_from_rdb(config)?;
-    serve(listener, Arc::new(Mutex::new(map))).await
+    let path = std::path::Path::new(&config.dir).join(&config.dbfilename);
+    let server = Server::new(Arc::new(Mutex::new(map)), path);
+    serve(listener, server).await
 }
 
-/// The shared accept loop behind both entry points. The store is cloned (an
+/// The shared accept loop behind both entry points. The [`Server`] is cloned (an
 /// `Arc` handle bump) into every connection task. This never returns under
 /// normal operation; an error is only produced if `accept` itself fails.
-async fn serve(listener: TcpListener, storage: Store) -> Result<()> {
+async fn serve(listener: TcpListener, server: Server) -> Result<()> {
     loop {
         let (stream, _) = listener.accept().await?;
         println!("accepted new connection");
-        let storage = storage.clone();
+        let server = server.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_conn(stream, storage).await {
+            if let Err(e) = handle_conn(stream, server).await {
                 eprintln!("Connection error: {:?}", e);
             }
         });
     }
 }
 
-async fn handle_conn(stream: TcpStream, storage: Store) -> Result<()> {
+async fn handle_conn(stream: TcpStream, server: Server) -> Result<()> {
     let mut handler = resp::RespHandler::new(stream);
     loop {
         let value = match handler.read_value().await {
@@ -282,7 +406,7 @@ async fn handle_conn(stream: TcpStream, storage: Store) -> Result<()> {
 
         // A malformed request produces an error reply, not a dropped
         // connection, so one bad client can't take down its own session.
-        let response = process_command(value, &storage);
+        let response = process_command(value, &server);
         handler.write_value(response).await?;
     }
     Ok(())
@@ -292,12 +416,14 @@ async fn handle_conn(stream: TcpStream, storage: Store) -> Result<()> {
 ///
 /// Public so integration tests can exercise command dispatch directly, and so
 /// the logic lives beside the rest of the server rather than in the binary.
-pub fn process_command(value: Value, storage: &Store) -> Value {
+pub fn process_command(value: Value, server: &Server) -> Value {
     let (command, args) = match extract_command(value) {
         Ok(parts) => parts,
         Err(e) => return Value::Error(format!("ERR {}", e)),
     };
 
+    // Most commands only touch the keyspace; `SAVE`/`BGSAVE` also need the path.
+    let storage = &server.store;
     match command.to_lowercase().as_str() {
         "ping" => match args.first() {
             Some(v) => v.clone(),
@@ -324,6 +450,8 @@ pub fn process_command(value: Value, storage: &Store) -> Value {
         "hget" => hget(&args, storage),
         "hgetall" => hgetall(&args, storage),
         "hdel" => hdel(&args, storage),
+        "save" => save(&args, server),
+        "bgsave" => bgsave(&args, server),
         c => Value::Error(format!("ERR unknown command '{}'", c)),
     }
 }
@@ -1490,6 +1618,103 @@ mod tests {
         assert_eq!(
             Config::parse(argv(&["-p", "70000"])).unwrap_err(),
             "invalid port number '70000'"
+        );
+    }
+
+    // Build the [`rdb::RdbEntry`]s for a store, then convert the same expiry the
+    // other way with `entries_to_store`, and confirm a future deadline survives
+    // the monotonic → wall-clock → monotonic round trip and an expired key is
+    // dropped on save.
+    #[test]
+    fn map_to_rdb_entries_drops_expired_and_converts_future_deadlines() {
+        let now = Instant::now();
+        let mut map = HashMap::new();
+        map.insert(
+            "live".to_string(),
+            Entry {
+                value: StoredValue::Str("v".to_string()),
+                expires_at: Some(now + Duration::from_secs(10)),
+            },
+        );
+        map.insert(
+            "dead".to_string(),
+            Entry {
+                value: StoredValue::Str("v".to_string()),
+                expires_at: Some(now - Duration::from_secs(1)),
+            },
+        );
+        map.insert(
+            "forever".to_string(),
+            Entry {
+                value: StoredValue::Str("v".to_string()),
+                expires_at: None,
+            },
+        );
+
+        let entries = map_to_rdb_entries(&map, 1_000_000, now);
+        // The already-lapsed key is not persisted.
+        assert!(!entries.iter().any(|e| e.key == "dead"));
+        assert_eq!(entries.len(), 2);
+        // The live key's deadline is now-plus-10s on the wall clock.
+        let live = entries.iter().find(|e| e.key == "live").unwrap();
+        assert_eq!(live.expire_at_ms, Some(1_000_000 + 10_000));
+        // The immortal key carries no deadline.
+        let forever = entries.iter().find(|e| e.key == "forever").unwrap();
+        assert_eq!(forever.expire_at_ms, None);
+    }
+
+    #[test]
+    fn save_writes_a_snapshot_that_reloads_every_value_type() {
+        let dir = std::env::temp_dir().join(format!("flashdb-save-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("dump.rdb");
+
+        let s = store();
+        set(&[bulk("greeting"), bulk("hello world")], &s);
+        push(&[bulk("l"), bulk("a"), bulk("b")], &s, Side::Right);
+        hset(&[bulk("h"), bulk("f"), bulk("v")], &s);
+        let server = Server::new(s.clone(), path.clone());
+        assert_eq!(save(&[], &server), Value::SimpleString("OK".to_string()));
+
+        // Reload the file exactly as startup would.
+        let cfg = Config {
+            port: 6379,
+            dir: dir.to_string_lossy().into_owned(),
+            dbfilename: "dump.rdb".to_string(),
+        };
+        let reloaded = load_store_from_rdb(&cfg).unwrap();
+
+        match &reloaded.get("greeting").unwrap().value {
+            StoredValue::Str(v) => assert_eq!(v, "hello world"),
+            other => panic!("expected a string, got {other:?}"),
+        }
+        match &reloaded.get("l").unwrap().value {
+            StoredValue::List(list) => {
+                assert_eq!(
+                    list.iter().cloned().collect::<Vec<_>>(),
+                    vec!["a".to_string(), "b".to_string()]
+                );
+            }
+            other => panic!("expected a list, got {other:?}"),
+        }
+        match &reloaded.get("h").unwrap().value {
+            StoredValue::Hash(map) => assert_eq!(map.get("f").map(String::as_str), Some("v")),
+            other => panic!("expected a hash, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_and_bgsave_reject_arguments() {
+        let server = Server::new(store(), PathBuf::from("unused.rdb"));
+        assert_eq!(
+            save(&[bulk("x")], &server),
+            Value::Error("ERR wrong number of arguments for 'save' command".to_string())
+        );
+        assert_eq!(
+            bgsave(&[bulk("x")], &server),
+            Value::Error("ERR wrong number of arguments for 'bgsave' command".to_string())
         );
     }
 }
