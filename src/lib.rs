@@ -104,24 +104,30 @@ fn expire_if_due(map: &mut HashMap<String, Entry>, key: &str, now: Instant) {
 /// Startup configuration parsed from the command-line arguments.
 ///
 /// These mirror the Redis server flags FlashDB understands so far: `-p`/`--port`
-/// chooses the listening port, and `--dir` / `--dbfilename` name where an RDB
-/// snapshot lives on disk. The two RDB fields aren't consulted yet (persistence
-/// is Phase 3) but are parsed and held now so the wiring is ready the day
-/// `SAVE`/load arrive.
+/// chooses the listening port, `--dir` / `--dbfilename` name where the on-disk
+/// RDB snapshot lives, and `--replicaof <host> <port>` starts the server as a
+/// replica that syncs from a master on boot.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Config {
     pub port: u16,
     pub dir: String,
     pub dbfilename: String,
+    /// If set, this server starts as a *replica* of the master at
+    /// `(host, port)`: on startup it dials the master, performs the replication
+    /// handshake, and loads the master's snapshot into its own keyspace. `None`
+    /// means a normal standalone server. Parsed from `--replicaof <host> <port>`.
+    pub replicaof: Option<(String, u16)>,
 }
 
 impl Default for Config {
-    /// Redis's own defaults: port 6379, the current directory, `dump.rdb`.
+    /// Redis's own defaults: port 6379, the current directory, `dump.rdb`, and
+    /// no master (a standalone server).
     fn default() -> Self {
         Config {
             port: 6379,
             dir: ".".to_string(),
             dbfilename: "dump.rdb".to_string(),
+            replicaof: None,
         }
     }
 }
@@ -155,6 +161,16 @@ impl Config {
                 }
                 "--dir" => config.dir = value_for(&mut it)?,
                 "--dbfilename" => config.dbfilename = value_for(&mut it)?,
+                "--replicaof" => {
+                    // Redis spells this `--replicaof <masterhost> <masterport>`:
+                    // two separate arguments, so we pull both.
+                    let host = value_for(&mut it)?;
+                    let raw_port = value_for(&mut it)?;
+                    let port = raw_port
+                        .parse::<u16>()
+                        .map_err(|_| format!("invalid master port number '{raw_port}'"))?;
+                    config.replicaof = Some((host, port));
+                }
                 other => return Err(format!("unknown argument '{other}'")),
             }
         }
@@ -1061,6 +1077,38 @@ mod tests {
         Value::BulkString(s.to_string())
     }
 
+    // Small helper: turn a slice of &str into the owned String iterator
+    // `Config::parse` expects, so tests read like a command line.
+    fn args(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn config_defaults_to_standalone() {
+        let config = Config::parse(args(&[])).unwrap();
+        assert_eq!(config, Config::default());
+        assert_eq!(config.replicaof, None);
+    }
+
+    #[test]
+    fn config_parses_replicaof_host_and_port() {
+        let config = Config::parse(args(&["--replicaof", "127.0.0.1", "6379"])).unwrap();
+        assert_eq!(config.replicaof, Some(("127.0.0.1".to_string(), 6379)));
+    }
+
+    #[test]
+    fn config_rejects_a_bad_master_port() {
+        let err = Config::parse(args(&["--replicaof", "localhost", "notaport"])).unwrap_err();
+        assert!(err.contains("invalid master port"));
+    }
+
+    #[test]
+    fn config_reports_a_missing_replicaof_value() {
+        // Host given but the port ran off the end of the argument list.
+        let err = Config::parse(args(&["--replicaof", "localhost"])).unwrap_err();
+        assert!(err.contains("missing value for --replicaof"));
+    }
+
     #[test]
     fn entry_without_expiry_never_expires_and_has_no_ttl() {
         let e = Entry {
@@ -1603,6 +1651,7 @@ mod tests {
             port: 6379,
             dir: "/nonexistent-flashdb-dir".to_string(),
             dbfilename: "nope.rdb".to_string(),
+            replicaof: None,
         };
         let map = load_store_from_rdb(&cfg).expect("a missing file is not an error");
         assert!(map.is_empty());
@@ -1681,6 +1730,7 @@ mod tests {
             port: 6379,
             dir: dir.to_string_lossy().into_owned(),
             dbfilename: "dump.rdb".to_string(),
+            replicaof: None,
         };
         let reloaded = load_store_from_rdb(&cfg).unwrap();
 

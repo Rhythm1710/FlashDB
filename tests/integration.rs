@@ -479,6 +479,7 @@ async fn start_server_with_rdb(dir: PathBuf, dbfilename: &str) -> std::net::Sock
         port: 0, // unused: the listener is already bound
         dir: dir.to_string_lossy().into_owned(),
         dbfilename: dbfilename.to_string(),
+        replicaof: None,
     };
     tokio::spawn(async move {
         let _ = flashdb::run_with_config(listener, &config).await;
