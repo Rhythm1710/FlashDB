@@ -6,12 +6,14 @@
 //! talk to it over a genuine TCP socket, exactly as a client would.
 
 use anyhow::Result;
+use bytes::Bytes;
 use resp::Value;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc;
 
 pub mod rdb;
 pub mod replication;
@@ -342,14 +344,58 @@ fn bgsave(args: &[Value], server: &Server) -> Value {
     Value::SimpleString("Background saving started".to_string())
 }
 
-/// The shared runtime state every connection task holds: the keyspace, plus the
-/// path `SAVE` / `BGSAVE` persist it to. Cloning a `Server` is cheap — the store
-/// is an `Arc` handle and the path sits behind an `Arc` — so each connection
-/// gets its own handle to the same state.
+/// `WAIT numreplicas timeout` — how many replicas have the master's writes.
+///
+/// In real Redis this *blocks* until at least `numreplicas` replicas have
+/// acknowledged the master's current replication offset, or `timeout`
+/// milliseconds pass, then returns the number that acked. FlashDB streams
+/// writes but doesn't yet track each replica's acknowledged offset, so it can't
+/// honour the "up to this offset" part. Instead it returns the number of
+/// replicas currently connected — a truthful count of who is receiving the
+/// stream — immediately. Offset-accurate, blocking `WAIT` is a follow-up.
+///
+/// The two arguments are still validated as integers so a malformed `WAIT` is
+/// rejected the way Redis rejects it, even though we don't act on their values.
+fn wait(args: &[Value], server: &Server) -> Value {
+    if args.len() != 2 {
+        return wrong_args("wait");
+    }
+    for arg in args {
+        if unpack_int(arg).is_err() {
+            return Value::Error("ERR value is not an integer or out of range".to_string());
+        }
+    }
+    Value::Integer(connected_replica_count(&server.replicas) as i64)
+}
+
+/// Count the replicas whose link is still live, dropping any whose task has
+/// ended (its receiver dropped, so the sender now reports closed). Pruning here
+/// keeps a disconnected replica from being counted forever.
+fn connected_replica_count(replicas: &Replicas) -> usize {
+    let mut list = replicas.lock().unwrap();
+    list.retain(|tx| !tx.is_closed());
+    list.len()
+}
+
+/// The set of currently-connected replicas, as the sending halves of their
+/// per-replica channels.
+///
+/// When a client issues a write, `process_command` re-serializes that command
+/// and pushes the bytes into every sender here; each replica's own task
+/// ([`serve_replica`]) owns the matching receiver and writes the bytes down its
+/// socket. `Arc<Mutex<..>>` because *any* connection task — whichever client ran
+/// the write — needs to reach this one shared list.
+type Replicas = Arc<Mutex<Vec<mpsc::UnboundedSender<Bytes>>>>;
+
+/// The shared runtime state every connection task holds: the keyspace, the path
+/// `SAVE` / `BGSAVE` persist it to, and the registry of connected replicas that
+/// writes are streamed to. Cloning a `Server` is cheap — every field is an `Arc`
+/// handle — so each connection gets its own handle to the same shared state.
 #[derive(Clone)]
 pub struct Server {
     store: Store,
     rdb_path: Arc<PathBuf>,
+    replicas: Replicas,
 }
 
 impl Server {
@@ -357,6 +403,7 @@ impl Server {
         Server {
             store,
             rdb_path: Arc::new(rdb_path),
+            replicas: Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
@@ -489,6 +536,12 @@ pub fn process_command(value: Value, server: &Server) -> Value {
         "hdel" => hdel(&args, storage),
         "save" => save(&args, server),
         "bgsave" => bgsave(&args, server),
+        // A replica announces its listening port and capabilities with REPLCONF
+        // during the handshake; the master just acknowledges each one. (When the
+        // master later sends `REPLCONF GETACK` the *replica* answers — that
+        // direction is the replica's job, not handled here.)
+        "replconf" => Value::SimpleString("OK".to_string()),
+        "wait" => wait(&args, server),
         c => Value::Error(format!("ERR unknown command '{}'", c)),
     }
 }
@@ -1102,6 +1155,42 @@ mod tests {
     // `Config::parse` expects, so tests read like a command line.
     fn args(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn server() -> Server {
+        Server::new(store(), PathBuf::from("dump.rdb"))
+    }
+
+    #[test]
+    fn wait_reports_zero_replicas_when_none_are_connected() {
+        let srv = server();
+        assert_eq!(wait(&[bulk("0"), bulk("100")], &srv), Value::Integer(0));
+    }
+
+    #[test]
+    fn wait_counts_connected_replicas_and_prunes_dead_ones() {
+        let srv = server();
+        // Two live replicas: keep their receivers alive so the senders stay open.
+        let (tx1, _rx1) = mpsc::unbounded_channel::<Bytes>();
+        let (tx2, _rx2) = mpsc::unbounded_channel::<Bytes>();
+        // A third whose receiver is dropped immediately, so its sender is closed.
+        let (tx3, rx3) = mpsc::unbounded_channel::<Bytes>();
+        drop(rx3);
+        srv.replicas.lock().unwrap().extend([tx1, tx2, tx3]);
+
+        // WAIT counts the two live links and prunes the dead one.
+        assert_eq!(wait(&[bulk("2"), bulk("50")], &srv), Value::Integer(2));
+        assert_eq!(srv.replicas.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn wait_validates_its_arguments() {
+        let srv = server();
+        assert_eq!(wait(&[bulk("0")], &srv), wrong_args("wait"));
+        assert_eq!(
+            wait(&[bulk("x"), bulk("100")], &srv),
+            Value::Error("ERR value is not an integer or out of range".to_string())
+        );
     }
 
     #[test]
