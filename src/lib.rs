@@ -442,19 +442,20 @@ pub async fn run_with_config(listener: TcpListener, config: &Config) -> Result<(
 
     // If we were told to replicate, kick off the sync in the background so the
     // handshake with the master runs alongside — not before — us accepting our
-    // own clients. Replicated keys are merged into the shared store as they
-    // load; a sync failure is logged and the server keeps serving.
+    // own clients. The task loads the master's snapshot, then stays connected
+    // and applies its live write stream; a failure (or the link ending) is
+    // logged and the server keeps serving whatever it already had.
     if let Some((host, master_port)) = &config.replicaof {
         let master_addr = format!("{host}:{master_port}");
         let listening_port = config.port;
-        let store = server.store.clone();
+        let server_for_repl = server.clone();
         tokio::spawn(async move {
             if let Err(e) =
-                replication::sync_from_master(&master_addr, listening_port, &store).await
+                replication::sync_from_master(&master_addr, listening_port, server_for_repl).await
             {
                 eprintln!("Replication sync from {master_addr} failed: {e:?}");
             } else {
-                println!("Replication: synced snapshot from master {master_addr}");
+                println!("Replication link to master {master_addr} closed");
             }
         });
     }

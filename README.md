@@ -69,6 +69,7 @@ starting.
 - `HDEL key field [field ...]`
 - `SAVE`
 - `BGSAVE`
+- `WAIT numreplicas timeout`
 
 ## Value types
 
@@ -164,8 +165,10 @@ redis-cli -p 6379 LRANGE mylist 0 -1   # 1) "a" 2) "b" 3) "c" — loaded by Redi
 
 ## Replication
 
-FlashDB can start as a **replica** of another server and copy its keyspace on
-boot:
+FlashDB speaks **both sides** of the replication link: it can start as a replica
+of another server, and it can act as a master that feeds replicas.
+
+Start a replica pointed at a master:
 
 ```sh
 flashdb -p 6380 --replicaof 127.0.0.1 6379
@@ -180,10 +183,18 @@ loads it through the same RDB reader used for on-disk startup loading, so string
 lists, hashes, and expiry all transfer. The master can be another FlashDB
 instance or a real `redis-server`.
 
-The handshake runs on a background task, so the replica serves its own clients
-while it syncs; a failure to reach the master is logged and the replica keeps
-serving whatever it already had. Streaming the master's *ongoing* writes after
-the initial snapshot (the live replication link) is not implemented yet.
+After the snapshot the link stays open. The **master streams every write it
+applies** (`SET`, `DEL`, `EXPIRE`, the list and hash mutations, …) down the
+connection as ordinary RESP commands, and the **replica replays each one**
+against its own keyspace, so a change on the master shows up on the replica a
+moment later. Reads and rejected commands are never streamed. `WAIT numreplicas
+timeout` reports how many replicas are currently connected. The whole sync runs
+on a background task, so both servers keep serving their own clients throughout;
+if the master is unreachable the replica logs it and serves whatever it had.
+
+Not yet implemented: per-replica acknowledged offsets (so `WAIT` reports
+connection count rather than blocking until writes are acked), replica reconnect
+with backoff, a runtime `REPLICAOF` command, and partial resync.
 
 ## Protocol notes
 

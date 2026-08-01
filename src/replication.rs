@@ -23,11 +23,14 @@
 //! bytes we hand them straight to the existing `parse_rdb` + `entries_to_store`
 //! path that startup loading already uses.
 //!
-//! Propagating the master's *ongoing* writes after the snapshot (the streamed
-//! command replication link) is Phase 3.4 — this module gets the replica caught
-//! up to the master's state at connect time.
+//! After the snapshot, the replica keeps the link open and applies the master's
+//! *ongoing* writes: the master streams every mutating command down the same
+//! connection as an ordinary RESP array, and the replica parses each one and
+//! runs it against its own store, so the two keyspaces stay in step. That live
+//! stream is the second half of this module (see [`ReplConn::stream_writes`]);
+//! the master side that produces it lives in [`crate::serve_replica`].
 
-use crate::{entries_to_store, now_unix_ms, rdb, Store};
+use crate::{entries_to_store, now_unix_ms, process_command, rdb, resp, Server, Store};
 use anyhow::{bail, Context, Result};
 use bytes::{Buf, BytesMut};
 use std::time::Instant;
@@ -35,19 +38,27 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 /// Connect to the master at `master_addr`, run the replication handshake
-/// announcing our own client `listening_port`, receive the master's RDB
-/// snapshot, and merge its keys into `store`.
+/// announcing our own client `listening_port`, load the master's RDB snapshot
+/// into `server`'s store, then stay connected and apply the master's ongoing
+/// writes as they stream in.
 ///
-/// Any failure — the master being unreachable, a malformed reply, an
-/// unparseable snapshot — is returned as an error for the caller to log; the
-/// replica keeps serving whatever it already had rather than crashing.
-pub async fn sync_from_master(master_addr: &str, listening_port: u16, store: &Store) -> Result<()> {
+/// This returns only when the link ends — the master closing the connection
+/// cleanly is `Ok(())`; anything else (unreachable master, malformed reply,
+/// unparseable snapshot, a mid-frame drop) is an error the caller logs. Either
+/// way the replica keeps serving whatever it already had rather than crashing.
+pub async fn sync_from_master(
+    master_addr: &str,
+    listening_port: u16,
+    server: Server,
+) -> Result<()> {
     let stream = TcpStream::connect(master_addr)
         .await
         .with_context(|| format!("connecting to master at {master_addr}"))?;
     let mut conn = ReplConn::new(stream);
     let rdb_bytes = conn.handshake(listening_port).await?;
-    load_rdb_into_store(&rdb_bytes, store)
+    load_rdb_into_store(&rdb_bytes, &server.store)?;
+    // Caught up to the snapshot; now follow the master's live write stream.
+    conn.stream_writes(&server).await
 }
 
 /// Parse a received RDB image and merge its entries into the live store.
@@ -194,6 +205,52 @@ where
             self.fill().await?;
         }
         Ok(self.buf.split_to(len).to_vec())
+    }
+
+    /// Follow the master's live write stream until the link ends.
+    ///
+    /// After the snapshot, the master forwards each write it applies as an
+    /// ordinary RESP command array on this same connection. We read them one
+    /// frame at a time and replay each against our own store via
+    /// [`process_command`], discarding the reply — a replica doesn't answer the
+    /// master for propagated writes. A clean close by the master ends the loop
+    /// with `Ok(())`.
+    async fn stream_writes(&mut self, server: &Server) -> Result<()> {
+        while let Some(command) = self.read_command().await? {
+            // The reply is intentionally dropped: this is one-way replication,
+            // and `process_command` already applied the change to our store.
+            let _ = process_command(command, server);
+        }
+        Ok(())
+    }
+
+    /// Read the next whole RESP command frame the master sent, or `None` when
+    /// the master closes the connection cleanly between frames.
+    ///
+    /// Reuses the same incremental parser the server uses for client input, so
+    /// a command split across TCP reads is reassembled and several commands
+    /// arriving in one read are drained one call at a time.
+    async fn read_command(&mut self) -> Result<Option<resp::Value>> {
+        loop {
+            match resp::parse_message(&self.buf) {
+                Ok(Some((value, consumed))) => {
+                    self.buf.advance(consumed);
+                    return Ok(Some(value));
+                }
+                // Not a full frame yet — pull more bytes, or stop if the master
+                // hung up. A clean close mid-buffer (partial frame) is an error.
+                Ok(None) => {
+                    let n = self.stream.read_buf(&mut self.buf).await?;
+                    if n == 0 {
+                        if self.buf.is_empty() {
+                            return Ok(None);
+                        }
+                        bail!("master closed the connection mid-frame");
+                    }
+                }
+                Err(e) => bail!("protocol error in the master's command stream: {e}"),
+            }
+        }
     }
 }
 

@@ -783,3 +783,86 @@ async fn replica_loads_the_masters_snapshot_over_the_wire() {
     send(&mut client, b"*2\r\n$7\r\nPERSIST\r\n$4\r\ntemp\r\n").await;
     expect_reply(&mut client, ":1\r\n").await;
 }
+
+// --- Replication (master side) -------------------------------------------
+
+#[tokio::test]
+async fn a_real_flashdb_replica_syncs_and_follows_its_master() {
+    // A real FlashDB master (not a mock) with one key already set.
+    let master_addr = start_server().await;
+    let mut master = connect(master_addr).await;
+    send(
+        &mut master,
+        b"*3\r\n$3\r\nSET\r\n$4\r\nboot\r\n$2\r\nhi\r\n",
+    )
+    .await;
+    expect_reply(&mut master, "+OK\r\n").await;
+
+    // A real FlashDB replica points at it and syncs on boot.
+    let replica_addr = start_replica(master_addr, "master-prop").await;
+    let mut replica = connect(replica_addr).await;
+
+    // The initial snapshot carried the pre-existing key across.
+    let synced = wait_for_get(
+        &mut replica,
+        b"*2\r\n$3\r\nGET\r\n$4\r\nboot\r\n",
+        "$2\r\nhi\r\n",
+        40,
+    )
+    .await;
+    assert!(synced, "replica never loaded the master's initial snapshot");
+
+    // A brand-new write on the master must now stream to the replica live.
+    send(
+        &mut master,
+        b"*3\r\n$3\r\nSET\r\n$5\r\nlive1\r\n$5\r\nvalue\r\n",
+    )
+    .await;
+    expect_reply(&mut master, "+OK\r\n").await;
+    let streamed = wait_for_get(
+        &mut replica,
+        b"*2\r\n$3\r\nGET\r\n$5\r\nlive1\r\n",
+        "$5\r\nvalue\r\n",
+        40,
+    )
+    .await;
+    assert!(
+        streamed,
+        "a post-sync SET on the master never reached the replica"
+    );
+
+    // Deletes propagate too: removing the key on the master clears it downstream.
+    send(&mut master, b"*2\r\n$3\r\nDEL\r\n$4\r\nboot\r\n").await;
+    expect_reply(&mut master, ":1\r\n").await;
+    let deleted = wait_for_get(
+        &mut replica,
+        b"*2\r\n$3\r\nGET\r\n$4\r\nboot\r\n",
+        "$-1\r\n",
+        40,
+    )
+    .await;
+    assert!(
+        deleted,
+        "a DEL on the master never propagated to the replica"
+    );
+}
+
+#[tokio::test]
+async fn the_master_counts_its_replica_via_wait() {
+    let master_addr = start_server().await;
+    // No replicas yet: WAIT returns 0 at once.
+    let mut master = connect(master_addr).await;
+    send(&mut master, b"*3\r\n$4\r\nWAIT\r\n$1\r\n0\r\n$3\r\n100\r\n").await;
+    expect_reply(&mut master, ":0\r\n").await;
+
+    // Once a replica has connected and finished its handshake, WAIT sees it.
+    let _replica_addr = start_replica(master_addr, "wait-count").await;
+    let saw_replica = wait_for_get(
+        &mut master,
+        b"*3\r\n$4\r\nWAIT\r\n$1\r\n1\r\n$3\r\n100\r\n",
+        ":1\r\n",
+        40,
+    )
+    .await;
+    assert!(saw_replica, "master never counted the connected replica");
+}
