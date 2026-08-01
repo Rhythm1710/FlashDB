@@ -12,6 +12,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
@@ -377,6 +378,15 @@ fn connected_replica_count(replicas: &Replicas) -> usize {
     list.len()
 }
 
+/// The fixed replication ID this master reports in its `+FULLRESYNC` reply.
+///
+/// Real Redis generates a random 40-hex-char run id each time it starts, and
+/// uses it (with an offset) to decide whether a reconnecting replica can do a
+/// *partial* resync instead of a full one. FlashDB only does full resyncs, and
+/// the replica side doesn't act on this value yet, so a constant is enough — and
+/// it keeps the handshake deterministic for tests.
+const REPLICATION_ID: &str = "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb";
+
 /// The set of currently-connected replicas, as the sending halves of their
 /// per-replica channels.
 ///
@@ -488,6 +498,14 @@ async fn handle_conn(stream: TcpStream, server: Server) -> Result<()> {
             }
         };
 
+        // `PSYNC` turns this connection from a normal client into a replica: it
+        // leaves the request/response loop for good and becomes a one-way stream
+        // of commands the master pushes. Hand the whole connection off to
+        // `serve_replica`, which never returns to this loop.
+        if command_name(&value).as_deref() == Some("psync") {
+            return serve_replica(handler, server).await;
+        }
+
         // A malformed request produces an error reply, not a dropped
         // connection, so one bad client can't take down its own session.
         let response = process_command(value, &server);
@@ -496,19 +514,96 @@ async fn handle_conn(stream: TcpStream, server: Server) -> Result<()> {
     Ok(())
 }
 
+/// Peek at the command name of a parsed request without consuming it: the
+/// lowercased first bulk string of the array, or `None` if the frame isn't a
+/// command array. Used to spot `PSYNC` before dispatch.
+fn command_name(value: &Value) -> Option<String> {
+    match value {
+        Value::Array(items) => match items.first() {
+            Some(Value::BulkString(name)) => Some(name.to_lowercase()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Turn a connection that just issued `PSYNC` into a live replica link.
+///
+/// Three steps: (1) answer `+FULLRESYNC <replid> 0`; (2) ship a full RDB
+/// snapshot of the current keyspace as a bulk payload — framed `$<len>\r\n`
+/// then exactly `len` bytes, with **no** trailing CRLF, which is the quirk the
+/// replica's `read_rdb_bulk` is written to expect; (3) register a channel and
+/// forward every subsequent write command down the socket until the replica
+/// disconnects.
+///
+/// The channel is the bridge between two worlds: `process_command` runs
+/// synchronously inside whichever *client's* task issued a write, and pushes the
+/// command's bytes into every replica's sender; this async task owns the
+/// matching receiver and does the actual socket write. We `select!` between the
+/// receiver and a read on the socket so a replica hanging up (a read of zero
+/// bytes) is noticed promptly rather than only on the next write.
+async fn serve_replica(handler: resp::RespHandler, server: Server) -> Result<()> {
+    let mut stream = handler.into_inner();
+
+    // (1) + (2): the FULLRESYNC line, then the initial snapshot.
+    stream
+        .write_all(format!("+FULLRESYNC {REPLICATION_ID} 0\r\n").as_bytes())
+        .await?;
+    let snapshot = snapshot_bytes(&server.store);
+    stream
+        .write_all(format!("${}\r\n", snapshot.len()).as_bytes())
+        .await?;
+    stream.write_all(&snapshot).await?;
+    stream.flush().await?;
+
+    // (3): register so writes begin flowing, then forward them.
+    let (tx, mut rx) = mpsc::unbounded_channel::<Bytes>();
+    server.replicas.lock().unwrap().push(tx);
+    println!("Replica synced; streaming writes to it");
+
+    let (mut read_half, mut write_half) = stream.split();
+    let mut scratch = [0u8; 512];
+    loop {
+        tokio::select! {
+            forwarded = rx.recv() => match forwarded {
+                // A write command to relay verbatim to the replica.
+                Some(bytes) => {
+                    write_half.write_all(&bytes).await?;
+                    write_half.flush().await?;
+                }
+                // Every sender dropped — only happens if the server is tearing
+                // down — so there's nothing left to stream.
+                None => break,
+            },
+            read = read_half.read(&mut scratch) => match read {
+                Ok(0) => break,       // the replica hung up
+                Ok(_) => {}           // a REPLCONF ACK or the like — ignored for now
+                Err(e) => return Err(e.into()),
+            },
+        }
+    }
+    // Dropping `rx` here (on return) closes our sender's channel, so the next
+    // `propagate` prunes this replica from the registry.
+    Ok(())
+}
+
 /// Route a parsed request to its command handler and produce a reply value.
 ///
 /// Public so integration tests can exercise command dispatch directly, and so
 /// the logic lives beside the rest of the server rather than in the binary.
 pub fn process_command(value: Value, server: &Server) -> Value {
-    let (command, args) = match extract_command(value) {
+    // Keep the original command frame around so a write can be forwarded to
+    // replicas verbatim after it runs; `extract_command` consumes its argument,
+    // so we clone before splitting it into name + args.
+    let (command, args) = match extract_command(value.clone()) {
         Ok(parts) => parts,
         Err(e) => return Value::Error(format!("ERR {}", e)),
     };
 
     // Most commands only touch the keyspace; `SAVE`/`BGSAVE` also need the path.
     let storage = &server.store;
-    match command.to_lowercase().as_str() {
+    let name = command.to_lowercase();
+    let response = match name.as_str() {
         "ping" => match args.first() {
             Some(v) => v.clone(),
             None => Value::SimpleString("PONG".to_string()),
@@ -543,7 +638,55 @@ pub fn process_command(value: Value, server: &Server) -> Value {
         "replconf" => Value::SimpleString("OK".to_string()),
         "wait" => wait(&args, server),
         c => Value::Error(format!("ERR unknown command '{}'", c)),
+    };
+
+    // Replication: after a write command runs, stream it to every connected
+    // replica so their keyspaces track this master's. A command that *failed*
+    // (returned an error — bad arity, WRONGTYPE, a syntax error) changed
+    // nothing, so it isn't propagated. This is a simplification of Redis's
+    // exact "did the dataset actually change?" rule, but it never propagates a
+    // rejected command.
+    if is_write_command(&name) && !matches!(response, Value::Error(_)) {
+        propagate(&server.replicas, &value);
     }
+    response
+}
+
+/// Does this (already-lowercased) command mutate the keyspace? Only writes are
+/// streamed to replicas; reads stay local to whichever server received them.
+/// Kept as one list so it's obvious which commands replicate — extend it in
+/// lock-step with the dispatch table above whenever a new write lands.
+fn is_write_command(name: &str) -> bool {
+    matches!(
+        name,
+        "set"
+            | "del"
+            | "expire"
+            | "persist"
+            | "rpush"
+            | "lpush"
+            | "rpop"
+            | "lpop"
+            | "hset"
+            | "hdel"
+    )
+}
+
+/// Fan one write command out to every connected replica.
+///
+/// The command is re-serialized to its RESP array and the same bytes are pushed
+/// into each replica's channel. Pushing is non-blocking — the unbounded channel
+/// takes the bytes immediately and each replica's own task does the socket write
+/// — so a slow replica never stalls the client that issued the write. A send
+/// fails only when that replica's task has ended (its receiver was dropped), so
+/// `retain` doubles as the place dead replicas are pruned from the registry.
+fn propagate(replicas: &Replicas, command: &Value) {
+    let mut list = replicas.lock().unwrap();
+    if list.is_empty() {
+        return;
+    }
+    let bytes = Bytes::from(command.serialize().into_bytes());
+    list.retain(|tx| tx.send(bytes.clone()).is_ok());
 }
 
 fn set(args: &[Value], storage: &Store) -> Value {
@@ -1190,6 +1333,78 @@ mod tests {
         assert_eq!(
             wait(&[bulk("x"), bulk("100")], &srv),
             Value::Error("ERR value is not an integer or out of range".to_string())
+        );
+    }
+
+    #[test]
+    fn write_commands_are_classified_for_replication() {
+        for w in [
+            "set", "del", "expire", "persist", "rpush", "lpush", "rpop", "lpop", "hset", "hdel",
+        ] {
+            assert!(is_write_command(w), "{w} should replicate");
+        }
+        for r in [
+            "get", "ttl", "type", "llen", "lrange", "hget", "hgetall", "ping", "echo", "save",
+            "bgsave", "wait", "replconf", "psync",
+        ] {
+            assert!(!is_write_command(r), "{r} should not replicate");
+        }
+    }
+
+    #[test]
+    fn propagate_sends_the_command_bytes_to_every_replica() {
+        let replicas: Replicas = Arc::new(Mutex::new(Vec::new()));
+        let (tx1, mut rx1) = mpsc::unbounded_channel::<Bytes>();
+        let (tx2, mut rx2) = mpsc::unbounded_channel::<Bytes>();
+        replicas.lock().unwrap().extend([tx1, tx2]);
+
+        let cmd = Value::Array(vec![bulk("SET"), bulk("k"), bulk("v")]);
+        propagate(&replicas, &cmd);
+
+        let want = Bytes::from(cmd.serialize().into_bytes());
+        assert_eq!(rx1.try_recv().unwrap(), want);
+        assert_eq!(rx2.try_recv().unwrap(), want);
+    }
+
+    #[test]
+    fn propagate_prunes_replicas_whose_receiver_is_gone() {
+        let replicas: Replicas = Arc::new(Mutex::new(Vec::new()));
+        let (tx_live, mut rx_live) = mpsc::unbounded_channel::<Bytes>();
+        let (tx_dead, rx_dead) = mpsc::unbounded_channel::<Bytes>();
+        drop(rx_dead); // this replica's task has ended
+        replicas.lock().unwrap().extend([tx_live, tx_dead]);
+
+        propagate(&replicas, &Value::Array(vec![bulk("DEL"), bulk("k")]));
+
+        // The dead sender was dropped from the registry; the live one delivered.
+        assert_eq!(replicas.lock().unwrap().len(), 1);
+        assert!(rx_live.try_recv().is_ok());
+    }
+
+    #[test]
+    fn a_write_through_process_command_reaches_a_replica() {
+        let srv = server();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Bytes>();
+        srv.replicas.lock().unwrap().push(tx);
+
+        let set = Value::Array(vec![bulk("SET"), bulk("k"), bulk("v")]);
+        assert_eq!(
+            process_command(set.clone(), &srv),
+            Value::SimpleString("OK".to_string())
+        );
+        // The SET was streamed to the replica verbatim...
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Bytes::from(set.serialize().into_bytes())
+        );
+
+        // ...but a read (GET) is not, and neither is a rejected write.
+        let _ = process_command(Value::Array(vec![bulk("GET"), bulk("k")]), &srv);
+        let bad_set = Value::Array(vec![bulk("SET")]); // too few args -> error
+        assert!(matches!(process_command(bad_set, &srv), Value::Error(_)));
+        assert!(
+            rx.try_recv().is_err(),
+            "no read or failed write should stream"
         );
     }
 

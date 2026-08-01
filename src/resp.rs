@@ -218,6 +218,17 @@ impl RespHandler {
         self.stream.write_all(value.serialize().as_bytes()).await?;
         Ok(())
     }
+
+    /// Consume the handler and hand back the raw stream underneath it.
+    ///
+    /// This is for a connection that stops being a request/response session and
+    /// becomes something else — a replica link, which after `PSYNC` turns into a
+    /// one-way stream of commands the master pushes. Any bytes still sitting in
+    /// `self.buffer` are dropped, but a replica sends nothing after `PSYNC` until
+    /// it starts acknowledging, so the buffer is empty at that hand-off point.
+    pub fn into_inner(self) -> TcpStream {
+        self.stream
+    }
 }
 
 #[cfg(test)]
