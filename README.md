@@ -70,6 +70,39 @@ starting.
 - `SAVE`
 - `BGSAVE`
 - `WAIT numreplicas timeout`
+- `MULTI`
+- `EXEC`
+- `DISCARD`
+- `WATCH key [key ...]`
+- `UNWATCH`
+
+## Transactions
+
+`MULTI` opens a transaction on the connection. Every command sent after it is
+**queued** rather than run — each is answered with `+QUEUED` — until `EXEC`
+replays the whole batch in order and returns one array holding each command's
+reply. `DISCARD` throws the queued batch away without running it.
+
+Queuing is validated up front: an unknown command is rejected the moment it is
+queued *and* taints the transaction, so the eventual `EXEC` aborts the whole
+batch with `EXECABORT` and runs nothing. A command that only fails at run time
+(for example a `WRONGTYPE` error) is not caught early — it runs, and its error
+is simply one element of the `EXEC` reply array; the commands around it still
+run, because a Redis transaction is a batch, not a rollback.
+
+`WATCH key [key ...]` adds optimistic locking (check-and-set). It records the
+current version of each named key; if any watched key is written by *any*
+connection before `EXEC`, the transaction aborts — `EXEC` replies with the nil
+array (`*-1`) and runs nothing — so the client can retry. Watching a key that
+does not exist yet still guards it: if it springs into existence before `EXEC`,
+that counts as a change. `UNWATCH` clears the watch set, and a completed `EXEC`
+or `DISCARD` clears it automatically. `WATCH` is not allowed once `MULTI` has
+opened a transaction.
+
+Transaction state (the queue and the watch set) lives per-connection, not in
+the shared keyspace, so two clients can run independent transactions at once.
+Writes inside a transaction replicate to replicas exactly as they would outside
+one.
 
 ## Value types
 

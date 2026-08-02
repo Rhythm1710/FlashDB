@@ -866,3 +866,130 @@ async fn the_master_counts_its_replica_via_wait() {
     .await;
     assert!(saw_replica, "master never counted the connected replica");
 }
+
+// --- Transactions: MULTI / EXEC / DISCARD / WATCH over a real socket ---
+
+#[tokio::test]
+async fn multi_queues_then_exec_runs_the_batch() {
+    let addr = start_server().await;
+    let mut client = connect(addr).await;
+
+    send(&mut client, b"*1\r\n$5\r\nMULTI\r\n").await;
+    expect_reply(&mut client, "+OK\r\n").await;
+    // Each queued command is answered +QUEUED, not run.
+    send(
+        &mut client,
+        b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n",
+    )
+    .await;
+    expect_reply(&mut client, "+QUEUED\r\n").await;
+    send(&mut client, b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n").await;
+    expect_reply(&mut client, "+QUEUED\r\n").await;
+
+    // EXEC returns one array with both replies in order.
+    send(&mut client, b"*1\r\n$4\r\nEXEC\r\n").await;
+    expect_reply(&mut client, "*2\r\n+OK\r\n$3\r\nbar\r\n").await;
+}
+
+#[tokio::test]
+async fn discard_throws_the_queue_away() {
+    let addr = start_server().await;
+    let mut client = connect(addr).await;
+
+    send(&mut client, b"*1\r\n$5\r\nMULTI\r\n").await;
+    expect_reply(&mut client, "+OK\r\n").await;
+    send(
+        &mut client,
+        b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n",
+    )
+    .await;
+    expect_reply(&mut client, "+QUEUED\r\n").await;
+    send(&mut client, b"*1\r\n$7\r\nDISCARD\r\n").await;
+    expect_reply(&mut client, "+OK\r\n").await;
+
+    // The SET never ran, so the key is still missing.
+    send(&mut client, b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n").await;
+    expect_reply(&mut client, "$-1\r\n").await;
+}
+
+#[tokio::test]
+async fn exec_without_multi_is_an_error() {
+    let addr = start_server().await;
+    let mut client = connect(addr).await;
+    send(&mut client, b"*1\r\n$4\r\nEXEC\r\n").await;
+    expect_reply(&mut client, "-ERR EXEC without MULTI\r\n").await;
+}
+
+#[tokio::test]
+async fn a_bad_command_in_a_transaction_makes_exec_abort() {
+    let addr = start_server().await;
+    let mut client = connect(addr).await;
+
+    send(&mut client, b"*1\r\n$5\r\nMULTI\r\n").await;
+    expect_reply(&mut client, "+OK\r\n").await;
+    send(
+        &mut client,
+        b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n",
+    )
+    .await;
+    expect_reply(&mut client, "+QUEUED\r\n").await;
+    // An unknown command is rejected at queue time and taints the transaction.
+    send(&mut client, b"*1\r\n$4\r\nNOPE\r\n").await;
+    expect_reply(&mut client, "-ERR unknown command 'nope'\r\n").await;
+
+    send(&mut client, b"*1\r\n$4\r\nEXEC\r\n").await;
+    expect_reply(
+        &mut client,
+        "-EXECABORT Transaction discarded because of previous errors.\r\n",
+    )
+    .await;
+    // The queued SET must not have run.
+    send(&mut client, b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n").await;
+    expect_reply(&mut client, "$-1\r\n").await;
+}
+
+#[tokio::test]
+async fn watch_aborts_exec_when_another_client_writes_the_key() {
+    let addr = start_server().await;
+    let mut alice = connect(addr).await;
+    let mut bob = connect(addr).await;
+
+    // Alice watches k and opens a transaction that would set it.
+    send(&mut alice, b"*2\r\n$5\r\nWATCH\r\n$1\r\nk\r\n").await;
+    expect_reply(&mut alice, "+OK\r\n").await;
+    send(&mut alice, b"*1\r\n$5\r\nMULTI\r\n").await;
+    expect_reply(&mut alice, "+OK\r\n").await;
+    send(&mut alice, b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$5\r\nalice\r\n").await;
+    expect_reply(&mut alice, "+QUEUED\r\n").await;
+
+    // Bob writes k out from under her.
+    send(&mut bob, b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$3\r\nbob\r\n").await;
+    expect_reply(&mut bob, "+OK\r\n").await;
+
+    // Alice's EXEC aborts with the nil array and changes nothing.
+    send(&mut alice, b"*1\r\n$4\r\nEXEC\r\n").await;
+    expect_reply(&mut alice, "*-1\r\n").await;
+    send(&mut alice, b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n").await;
+    expect_reply(&mut alice, "$3\r\nbob\r\n").await;
+}
+
+#[tokio::test]
+async fn watch_lets_exec_commit_when_the_key_is_untouched() {
+    let addr = start_server().await;
+    let mut client = connect(addr).await;
+
+    send(&mut client, b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\n1\r\n").await;
+    expect_reply(&mut client, "+OK\r\n").await;
+    send(&mut client, b"*2\r\n$5\r\nWATCH\r\n$1\r\nk\r\n").await;
+    expect_reply(&mut client, "+OK\r\n").await;
+    send(&mut client, b"*1\r\n$5\r\nMULTI\r\n").await;
+    expect_reply(&mut client, "+OK\r\n").await;
+    send(&mut client, b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\n2\r\n").await;
+    expect_reply(&mut client, "+QUEUED\r\n").await;
+
+    // Nobody else touched k, so EXEC commits.
+    send(&mut client, b"*1\r\n$4\r\nEXEC\r\n").await;
+    expect_reply(&mut client, "*1\r\n+OK\r\n").await;
+    send(&mut client, b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n").await;
+    expect_reply(&mut client, "$1\r\n2\r\n").await;
+}
