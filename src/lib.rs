@@ -418,6 +418,160 @@ impl Server {
     }
 }
 
+/// Per-connection transaction state.
+///
+/// Everything the server has held so far lived in the shared [`Server`] — one
+/// keyspace every client touches. A transaction is the first thing that is
+/// *private to one client*: the list of commands queued since `MULTI` belongs to
+/// the connection that typed them, not to the map. So this struct lives on the
+/// stack of [`handle_conn`], one per connection, and is threaded by `&mut` into
+/// command dispatch. It is deliberately not `Clone` and not shared — no `Arc`,
+/// no `Mutex` — because no other task ever needs to see it.
+#[derive(Default)]
+struct Session {
+    /// Are we between `MULTI` and `EXEC`/`DISCARD`? While true, ordinary
+    /// commands are queued rather than run.
+    in_multi: bool,
+    /// The commands queued since `MULTI`, replayed in order by `EXEC`.
+    queue: Vec<Value>,
+    /// A queued command was rejected at queue time (unknown command). Redis
+    /// remembers this and makes the eventual `EXEC` abort the *whole*
+    /// transaction rather than run a partial one.
+    dirty: bool,
+}
+
+impl Session {
+    /// Begin a transaction. Nested `MULTI` is an error in Redis (and would be
+    /// ambiguous — which `EXEC` closes which?), but it does not abort the
+    /// transaction already open.
+    fn multi(&mut self) -> Value {
+        if self.in_multi {
+            return Value::Error("ERR MULTI calls can not be nested".to_string());
+        }
+        self.in_multi = true;
+        Value::SimpleString("OK".to_string())
+    }
+
+    /// Queue one command to run at `EXEC`, or taint the transaction if it can
+    /// never run. Redis validates enough at queue time to reject an unknown
+    /// command up front (returning an error *and* setting the abort flag);
+    /// arity and type errors are left to surface inside the `EXEC` reply array,
+    /// which matches Redis for those runtime failures.
+    fn queue(&mut self, value: Value) -> Value {
+        match command_name(&value) {
+            Some(name) if is_known_command(&name) => {
+                self.queue.push(value);
+                Value::SimpleString("QUEUED".to_string())
+            }
+            Some(name) => {
+                self.dirty = true;
+                Value::Error(format!("ERR unknown command '{}'", name))
+            }
+            None => {
+                self.dirty = true;
+                Value::Error("ERR unknown command".to_string())
+            }
+        }
+    }
+
+    /// Run the queued commands as a batch and end the transaction.
+    ///
+    /// The transaction ends no matter what, so state is snapshotted and cleared
+    /// first. If any queued command was rejected, nothing runs and `EXEC`
+    /// reports `EXECABORT`. Otherwise every queued command runs in order through
+    /// the normal [`process_command`] path — so writes still replicate — and
+    /// their replies come back as one array. A runtime error (e.g. `WRONGTYPE`)
+    /// is just one element of that array; it does not stop the others, because
+    /// Redis transactions are batched, not rolled back.
+    fn exec(&mut self, server: &Server) -> Value {
+        if !self.in_multi {
+            return Value::Error("ERR EXEC without MULTI".to_string());
+        }
+        let queued = std::mem::take(&mut self.queue);
+        let dirty = self.dirty;
+        self.reset();
+
+        if dirty {
+            return Value::Error(
+                "EXECABORT Transaction discarded because of previous errors.".to_string(),
+            );
+        }
+        let results = queued
+            .into_iter()
+            .map(|cmd| process_command(cmd, server))
+            .collect();
+        Value::Array(results)
+    }
+
+    /// Throw away a transaction without running it.
+    fn discard(&mut self) -> Value {
+        if !self.in_multi {
+            return Value::Error("ERR DISCARD without MULTI".to_string());
+        }
+        self.reset();
+        Value::SimpleString("OK".to_string())
+    }
+
+    /// Return to the no-transaction state, dropping any queued commands.
+    fn reset(&mut self) {
+        self.in_multi = false;
+        self.queue.clear();
+        self.dirty = false;
+    }
+}
+
+/// Dispatch one request in the context of this connection's [`Session`].
+///
+/// The transaction controls (`MULTI`/`EXEC`/`DISCARD`) always act immediately.
+/// Everything else runs right away *unless* a transaction is open, in which case
+/// it is queued for later. This is the one place per-connection state and the
+/// shared server meet.
+fn handle_command(value: Value, server: &Server, session: &mut Session) -> Value {
+    match command_name(&value).as_deref() {
+        Some("multi") => session.multi(),
+        Some("exec") => session.exec(server),
+        Some("discard") => session.discard(),
+        _ if session.in_multi => session.queue(value),
+        _ => process_command(value, server),
+    }
+}
+
+/// Is `name` (already lowercased) a command this server dispatches? Used to
+/// reject an unknown command at `MULTI`-queue time. Kept in lock-step with the
+/// dispatch table in [`process_command`]; a command missing here would be
+/// queued and then fail at `EXEC` instead of being caught up front.
+fn is_known_command(name: &str) -> bool {
+    matches!(
+        name,
+        "ping"
+            | "echo"
+            | "set"
+            | "get"
+            | "del"
+            | "expire"
+            | "ttl"
+            | "persist"
+            | "type"
+            | "rpush"
+            | "lpush"
+            | "rpop"
+            | "lpop"
+            | "llen"
+            | "lrange"
+            | "hset"
+            | "hget"
+            | "hgetall"
+            | "hdel"
+            | "save"
+            | "bgsave"
+            | "replconf"
+            | "wait"
+            | "multi"
+            | "exec"
+            | "discard"
+    )
+}
+
 /// Accept connections on `listener` forever, serving each on its own task.
 ///
 /// Starts from an empty keyspace, persisting to `dump.rdb` in the working
@@ -481,6 +635,9 @@ async fn serve(listener: TcpListener, server: Server) -> Result<()> {
 
 async fn handle_conn(stream: TcpStream, server: Server) -> Result<()> {
     let mut handler = resp::RespHandler::new(stream);
+    // Transaction state is private to this connection, so it lives here on the
+    // task's stack rather than in the shared `Server`.
+    let mut session = Session::default();
     loop {
         let value = match handler.read_value().await {
             Ok(Some(v)) => v,
@@ -509,7 +666,9 @@ async fn handle_conn(stream: TcpStream, server: Server) -> Result<()> {
 
         // A malformed request produces an error reply, not a dropped
         // connection, so one bad client can't take down its own session.
-        let response = process_command(value, &server);
+        // Routing through `handle_command` (rather than `process_command`
+        // directly) is what lets `MULTI` queue the commands that follow it.
+        let response = handle_command(value, &server, &mut session);
         handler.write_value(response).await?;
     }
     Ok(())
@@ -1406,6 +1565,167 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "no read or failed write should stream"
+        );
+    }
+
+    // A command frame built from a command name plus string arguments, the
+    // shape `handle_command`/`process_command` expect.
+    fn cmd(parts: &[&str]) -> Value {
+        Value::Array(parts.iter().map(|p| bulk(p)).collect())
+    }
+
+    #[test]
+    fn multi_opens_a_transaction_and_queues_following_commands() {
+        let srv = server();
+        let mut s = Session::default();
+        assert_eq!(
+            handle_command(cmd(&["MULTI"]), &srv, &mut s),
+            Value::SimpleString("OK".to_string())
+        );
+        // Commands after MULTI are answered +QUEUED, not run.
+        assert_eq!(
+            handle_command(cmd(&["SET", "k", "v"]), &srv, &mut s),
+            Value::SimpleString("QUEUED".to_string())
+        );
+        // The write has not touched the store yet.
+        assert_eq!(get(&[bulk("k")], &srv.store), Value::Null);
+    }
+
+    #[test]
+    fn exec_runs_the_queue_in_order_and_returns_an_array_of_replies() {
+        let srv = server();
+        let mut s = Session::default();
+        handle_command(cmd(&["MULTI"]), &srv, &mut s);
+        handle_command(cmd(&["SET", "k", "v"]), &srv, &mut s);
+        handle_command(cmd(&["GET", "k"]), &srv, &mut s);
+
+        let reply = handle_command(cmd(&["EXEC"]), &srv, &mut s);
+        assert_eq!(
+            reply,
+            Value::Array(vec![
+                Value::SimpleString("OK".to_string()),
+                Value::BulkString("v".to_string()),
+            ])
+        );
+        // The transaction is closed: a plain command runs immediately again.
+        assert_eq!(
+            handle_command(cmd(&["GET", "k"]), &srv, &mut s),
+            Value::BulkString("v".to_string())
+        );
+    }
+
+    #[test]
+    fn discard_drops_the_queue_without_running_it() {
+        let srv = server();
+        let mut s = Session::default();
+        handle_command(cmd(&["MULTI"]), &srv, &mut s);
+        handle_command(cmd(&["SET", "k", "v"]), &srv, &mut s);
+        assert_eq!(
+            handle_command(cmd(&["DISCARD"]), &srv, &mut s),
+            Value::SimpleString("OK".to_string())
+        );
+        // Nothing ran, and we are no longer in a transaction.
+        assert_eq!(get(&[bulk("k")], &srv.store), Value::Null);
+        assert_eq!(
+            handle_command(cmd(&["EXEC"]), &srv, &mut s),
+            Value::Error("ERR EXEC without MULTI".to_string())
+        );
+    }
+
+    #[test]
+    fn exec_and_discard_without_multi_are_errors() {
+        let srv = server();
+        let mut s = Session::default();
+        assert_eq!(
+            handle_command(cmd(&["EXEC"]), &srv, &mut s),
+            Value::Error("ERR EXEC without MULTI".to_string())
+        );
+        assert_eq!(
+            handle_command(cmd(&["DISCARD"]), &srv, &mut s),
+            Value::Error("ERR DISCARD without MULTI".to_string())
+        );
+    }
+
+    #[test]
+    fn nested_multi_is_rejected_but_keeps_the_transaction_open() {
+        let srv = server();
+        let mut s = Session::default();
+        handle_command(cmd(&["MULTI"]), &srv, &mut s);
+        assert_eq!(
+            handle_command(cmd(&["MULTI"]), &srv, &mut s),
+            Value::Error("ERR MULTI calls can not be nested".to_string())
+        );
+        // Still queuing after the rejected nested MULTI.
+        assert_eq!(
+            handle_command(cmd(&["SET", "k", "v"]), &srv, &mut s),
+            Value::SimpleString("QUEUED".to_string())
+        );
+    }
+
+    #[test]
+    fn an_unknown_queued_command_aborts_the_whole_transaction() {
+        let srv = server();
+        let mut s = Session::default();
+        handle_command(cmd(&["MULTI"]), &srv, &mut s);
+        handle_command(cmd(&["SET", "k", "v"]), &srv, &mut s);
+        // A bogus command is rejected at queue time and taints the transaction.
+        assert!(matches!(
+            handle_command(cmd(&["NOPE"]), &srv, &mut s),
+            Value::Error(_)
+        ));
+        // EXEC now aborts wholesale; the earlier SET must NOT have run.
+        assert_eq!(
+            handle_command(cmd(&["EXEC"]), &srv, &mut s),
+            Value::Error("EXECABORT Transaction discarded because of previous errors.".to_string())
+        );
+        assert_eq!(get(&[bulk("k")], &srv.store), Value::Null);
+    }
+
+    #[test]
+    fn a_runtime_error_inside_exec_does_not_stop_the_other_commands() {
+        let srv = server();
+        let mut s = Session::default();
+        handle_command(cmd(&["MULTI"]), &srv, &mut s);
+        handle_command(cmd(&["SET", "k", "v"]), &srv, &mut s);
+        // LPUSH on a string key is a WRONGTYPE error at run time, not queue time.
+        handle_command(cmd(&["LPUSH", "k", "x"]), &srv, &mut s);
+        handle_command(cmd(&["SET", "k2", "v2"]), &srv, &mut s);
+
+        let reply = handle_command(cmd(&["EXEC"]), &srv, &mut s);
+        match reply {
+            Value::Array(items) => {
+                assert_eq!(items.len(), 3);
+                assert_eq!(items[0], Value::SimpleString("OK".to_string()));
+                assert!(matches!(items[1], Value::Error(_)));
+                assert_eq!(items[2], Value::SimpleString("OK".to_string()));
+            }
+            other => panic!("expected an array reply, got {other:?}"),
+        }
+        // The command after the error still ran.
+        assert_eq!(
+            get(&[bulk("k2")], &srv.store),
+            Value::BulkString("v2".to_string())
+        );
+    }
+
+    #[test]
+    fn queued_writes_propagate_to_replicas_when_exec_runs() {
+        let srv = server();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Bytes>();
+        srv.replicas.lock().unwrap().push(tx);
+        let mut s = Session::default();
+
+        handle_command(cmd(&["MULTI"]), &srv, &mut s);
+        handle_command(cmd(&["SET", "k", "v"]), &srv, &mut s);
+        // Queuing alone streams nothing to the replica.
+        assert!(rx.try_recv().is_err());
+
+        handle_command(cmd(&["EXEC"]), &srv, &mut s);
+        // Running the queue on EXEC replicates the write like any other.
+        let set = cmd(&["SET", "k", "v"]);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Bytes::from(set.serialize().into_bytes())
         );
     }
 

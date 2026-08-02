@@ -13,6 +13,11 @@ pub enum Value {
     BulkString(String),
     Array(Vec<Value>),
     Null,
+    /// The RESP null *array* (`*-1\r\n`), distinct from the null bulk string
+    /// (`$-1\r\n`, our [`Value::Null`]). Redis replies with this to an `EXEC`
+    /// whose `WATCH`ed keys changed underneath it — a nil multi-bulk, not a nil
+    /// string — so the two need separate variants on the wire.
+    NullArray,
 }
 
 impl Value {
@@ -28,6 +33,7 @@ impl Value {
             // RESP bulk length is measured in bytes, not chars.
             Value::BulkString(s) => format!("${}\r\n{}\r\n", s.len(), s),
             Value::Null => "$-1\r\n".to_string(),
+            Value::NullArray => "*-1\r\n".to_string(),
             Value::Array(items) => {
                 let mut out = format!("*{}\r\n", items.len());
                 for item in items {
@@ -265,6 +271,13 @@ mod tests {
     fn serialize_null_does_not_panic() {
         // Regression: a cache miss returns Null and must serialize, not panic.
         assert_eq!(Value::Null.serialize(), "$-1\r\n");
+    }
+
+    #[test]
+    fn serialize_null_array_is_distinct_from_null_bulk() {
+        // An aborted EXEC replies with the nil multi-bulk `*-1`, not `$-1`.
+        assert_eq!(Value::NullArray.serialize(), "*-1\r\n");
+        assert_ne!(Value::NullArray.serialize(), Value::Null.serialize());
     }
 
     #[test]
