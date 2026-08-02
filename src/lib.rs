@@ -397,15 +397,26 @@ const REPLICATION_ID: &str = "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb";
 /// the write — needs to reach this one shared list.
 type Replicas = Arc<Mutex<Vec<mpsc::UnboundedSender<Bytes>>>>;
 
+/// A per-key modification counter, bumped every time a key is successfully
+/// written. `WATCH` snapshots the counter of the keys it watches; `EXEC`
+/// re-reads them and aborts if any changed — that comparison, and nothing else,
+/// is how optimistic locking detects a concurrent write. Shared like the store
+/// because a write on *any* connection must be visible to a `WATCH` on another.
+/// A key that has never been written simply isn't present, which reads as
+/// version 0.
+type Versions = Arc<Mutex<HashMap<String, u64>>>;
+
 /// The shared runtime state every connection task holds: the keyspace, the path
-/// `SAVE` / `BGSAVE` persist it to, and the registry of connected replicas that
-/// writes are streamed to. Cloning a `Server` is cheap — every field is an `Arc`
-/// handle — so each connection gets its own handle to the same shared state.
+/// `SAVE` / `BGSAVE` persist it to, the registry of connected replicas that
+/// writes are streamed to, and the per-key version counters `WATCH` compares
+/// against. Cloning a `Server` is cheap — every field is an `Arc` handle — so
+/// each connection gets its own handle to the same shared state.
 #[derive(Clone)]
 pub struct Server {
     store: Store,
     rdb_path: Arc<PathBuf>,
     replicas: Replicas,
+    versions: Versions,
 }
 
 impl Server {
@@ -414,7 +425,14 @@ impl Server {
             store,
             rdb_path: Arc::new(rdb_path),
             replicas: Arc::new(Mutex::new(Vec::new())),
+            versions: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// The current version of `key`: the number of writes it has seen, or 0 for
+    /// a key never written. Read by `WATCH` (to snapshot) and `EXEC` (to compare).
+    fn version_of(&self, key: &str) -> u64 {
+        self.versions.lock().unwrap().get(key).copied().unwrap_or(0)
     }
 }
 
@@ -438,6 +456,10 @@ struct Session {
     /// remembers this and makes the eventual `EXEC` abort the *whole*
     /// transaction rather than run a partial one.
     dirty: bool,
+    /// Keys this connection is `WATCH`ing, each paired with its version at the
+    /// moment it was watched. `EXEC` aborts if any of these has changed since.
+    /// Empty means the transaction isn't guarded by optimistic locking.
+    watched: Vec<(String, u64)>,
 }
 
 impl Session {
@@ -474,27 +496,71 @@ impl Session {
         }
     }
 
+    /// Mark keys for optimistic locking. `WATCH` snapshots each key's current
+    /// version; if any of them is written before `EXEC`, the transaction aborts.
+    /// `WATCH` isn't allowed once a transaction is open (it would be pointless —
+    /// the check happens at `EXEC`, and there's nothing to guard mid-queue).
+    fn watch(&mut self, args: &[Value], server: &Server) -> Value {
+        if self.in_multi {
+            return Value::Error("ERR WATCH inside MULTI is not allowed".to_string());
+        }
+        if args.is_empty() {
+            return wrong_args("watch");
+        }
+        for arg in args {
+            let key = match unpack_bulk_str(arg) {
+                Ok(k) => k,
+                Err(e) => return Value::Error(format!("ERR {}", e)),
+            };
+            let version = server.version_of(&key);
+            self.watched.push((key, version));
+        }
+        Value::SimpleString("OK".to_string())
+    }
+
+    /// Forget every watched key, so the next `EXEC` is unguarded. Always OK,
+    /// even with nothing watched.
+    fn unwatch(&mut self) -> Value {
+        self.watched.clear();
+        Value::SimpleString("OK".to_string())
+    }
+
+    /// Have any watched keys changed since they were watched? A single mismatch
+    /// (or a key written for the first time, moving it off version 0) means a
+    /// concurrent writer got in, so `EXEC` must abort.
+    fn watch_conflict(&self, server: &Server) -> bool {
+        self.watched
+            .iter()
+            .any(|(key, watched_at)| server.version_of(key) != *watched_at)
+    }
+
     /// Run the queued commands as a batch and end the transaction.
     ///
     /// The transaction ends no matter what, so state is snapshotted and cleared
     /// first. If any queued command was rejected, nothing runs and `EXEC`
-    /// reports `EXECABORT`. Otherwise every queued command runs in order through
-    /// the normal [`process_command`] path — so writes still replicate — and
-    /// their replies come back as one array. A runtime error (e.g. `WRONGTYPE`)
-    /// is just one element of that array; it does not stop the others, because
-    /// Redis transactions are batched, not rolled back.
+    /// reports `EXECABORT`. If a `WATCH`ed key changed underneath us, `EXEC`
+    /// aborts by replying with the nil array and running nothing. Otherwise
+    /// every queued command runs in order through the normal [`process_command`]
+    /// path — so writes still replicate — and their replies come back as one
+    /// array. A runtime error (e.g. `WRONGTYPE`) is just one element of that
+    /// array; it does not stop the others, because Redis transactions are
+    /// batched, not rolled back.
     fn exec(&mut self, server: &Server) -> Value {
         if !self.in_multi {
             return Value::Error("ERR EXEC without MULTI".to_string());
         }
         let queued = std::mem::take(&mut self.queue);
         let dirty = self.dirty;
+        let conflict = self.watch_conflict(server);
         self.reset();
 
         if dirty {
             return Value::Error(
                 "EXECABORT Transaction discarded because of previous errors.".to_string(),
             );
+        }
+        if conflict {
+            return Value::NullArray;
         }
         let results = queued
             .into_iter()
@@ -512,11 +578,13 @@ impl Session {
         Value::SimpleString("OK".to_string())
     }
 
-    /// Return to the no-transaction state, dropping any queued commands.
+    /// Return to the no-transaction state, dropping any queued commands and
+    /// clearing the watch set — Redis unwatches after every `EXEC`/`DISCARD`.
     fn reset(&mut self) {
         self.in_multi = false;
         self.queue.clear();
         self.dirty = false;
+        self.watched.clear();
     }
 }
 
@@ -531,8 +599,20 @@ fn handle_command(value: Value, server: &Server, session: &mut Session) -> Value
         Some("multi") => session.multi(),
         Some("exec") => session.exec(server),
         Some("discard") => session.discard(),
+        Some("watch") => session.watch(command_args(&value), server),
+        Some("unwatch") => session.unwatch(),
         _ if session.in_multi => session.queue(value),
         _ => process_command(value, server),
+    }
+}
+
+/// Borrow a command frame's argument values (everything after the command name),
+/// or an empty slice if the frame isn't a non-empty command array. Lets the
+/// transaction controls read their arguments without cloning the frame apart.
+fn command_args(value: &Value) -> &[Value] {
+    match value {
+        Value::Array(items) if !items.is_empty() => &items[1..],
+        _ => &[],
     }
 }
 
@@ -569,6 +649,8 @@ fn is_known_command(name: &str) -> bool {
             | "multi"
             | "exec"
             | "discard"
+            | "watch"
+            | "unwatch"
     )
 }
 
@@ -808,8 +890,42 @@ pub fn process_command(value: Value, server: &Server) -> Value {
     // rejected command.
     if is_write_command(&name) && !matches!(response, Value::Error(_)) {
         propagate(&server.replicas, &value);
+        // Bump the version of every key this write touched so a `WATCH` on it
+        // elsewhere notices the change and aborts its `EXEC`.
+        bump_versions(&server.versions, &name, &args);
     }
     response
+}
+
+/// The keys a successful write command modified, so their versions can be
+/// bumped for `WATCH`. Every write here keys off its first argument — except
+/// `DEL`, which takes a whole list of keys. Kept alongside [`is_write_command`]:
+/// a new write command must appear in both.
+fn written_keys(name: &str, args: &[Value]) -> Vec<String> {
+    let key_args: &[Value] = match name {
+        "del" => args,
+        // set/expire/persist/rpush/lpush/rpop/lpop/hset/hdel all take the key
+        // first and touch only that one key.
+        _ => &args[..args.len().min(1)],
+    };
+    key_args
+        .iter()
+        .filter_map(|v| unpack_bulk_str(v).ok())
+        .collect()
+}
+
+/// Increment the version counter of each key a write touched. This is the write
+/// side of optimistic locking: `WATCH` snapshots these counters and `EXEC`
+/// compares against them.
+fn bump_versions(versions: &Versions, name: &str, args: &[Value]) {
+    let keys = written_keys(name, args);
+    if keys.is_empty() {
+        return;
+    }
+    let mut map = versions.lock().unwrap();
+    for key in keys {
+        *map.entry(key).or_insert(0) += 1;
+    }
 }
 
 /// Does this (already-lowercased) command mutate the keyspace? Only writes are
@@ -1727,6 +1843,138 @@ mod tests {
             rx.try_recv().unwrap(),
             Bytes::from(set.serialize().into_bytes())
         );
+    }
+
+    #[test]
+    fn watch_lets_exec_run_when_no_watched_key_changed() {
+        let srv = server();
+        let mut s = Session::default();
+        handle_command(cmd(&["SET", "k", "1"]), &srv, &mut s);
+        assert_eq!(
+            handle_command(cmd(&["WATCH", "k"]), &srv, &mut s),
+            Value::SimpleString("OK".to_string())
+        );
+        handle_command(cmd(&["MULTI"]), &srv, &mut s);
+        handle_command(cmd(&["SET", "k", "2"]), &srv, &mut s);
+        // Nobody else touched k, so EXEC goes through.
+        assert_eq!(
+            handle_command(cmd(&["EXEC"]), &srv, &mut s),
+            Value::Array(vec![Value::SimpleString("OK".to_string())])
+        );
+        assert_eq!(
+            get(&[bulk("k")], &srv.store),
+            Value::BulkString("2".to_string())
+        );
+    }
+
+    #[test]
+    fn exec_aborts_with_nil_when_a_watched_key_changed() {
+        let srv = server();
+        let mut watcher = Session::default();
+        handle_command(cmd(&["SET", "k", "1"]), &srv, &mut watcher);
+        handle_command(cmd(&["WATCH", "k"]), &srv, &mut watcher);
+        handle_command(cmd(&["MULTI"]), &srv, &mut watcher);
+        handle_command(cmd(&["SET", "k", "from-watcher"]), &srv, &mut watcher);
+
+        // A different connection writes k while the transaction is queued.
+        let mut other = Session::default();
+        handle_command(cmd(&["SET", "k", "from-other"]), &srv, &mut other);
+
+        // EXEC sees the version moved and aborts: nil array, nothing run.
+        assert_eq!(
+            handle_command(cmd(&["EXEC"]), &srv, &mut watcher),
+            Value::NullArray
+        );
+        assert_eq!(
+            get(&[bulk("k")], &srv.store),
+            Value::BulkString("from-other".to_string())
+        );
+    }
+
+    #[test]
+    fn watching_a_missing_key_that_then_appears_aborts_exec() {
+        let srv = server();
+        let mut watcher = Session::default();
+        // k does not exist yet -> watched at version 0.
+        handle_command(cmd(&["WATCH", "k"]), &srv, &mut watcher);
+        handle_command(cmd(&["MULTI"]), &srv, &mut watcher);
+        handle_command(cmd(&["GET", "k"]), &srv, &mut watcher);
+
+        let mut other = Session::default();
+        handle_command(cmd(&["SET", "k", "v"]), &srv, &mut other);
+
+        assert_eq!(
+            handle_command(cmd(&["EXEC"]), &srv, &mut watcher),
+            Value::NullArray
+        );
+    }
+
+    #[test]
+    fn unwatch_clears_the_guard_so_exec_runs() {
+        let srv = server();
+        let mut watcher = Session::default();
+        handle_command(cmd(&["SET", "k", "1"]), &srv, &mut watcher);
+        handle_command(cmd(&["WATCH", "k"]), &srv, &mut watcher);
+        assert_eq!(
+            handle_command(cmd(&["UNWATCH"]), &srv, &mut watcher),
+            Value::SimpleString("OK".to_string())
+        );
+
+        let mut other = Session::default();
+        handle_command(cmd(&["SET", "k", "2"]), &srv, &mut other);
+
+        handle_command(cmd(&["MULTI"]), &srv, &mut watcher);
+        handle_command(cmd(&["SET", "k", "3"]), &srv, &mut watcher);
+        // Watch was cleared, so the concurrent write doesn't abort us.
+        assert_eq!(
+            handle_command(cmd(&["EXEC"]), &srv, &mut watcher),
+            Value::Array(vec![Value::SimpleString("OK".to_string())])
+        );
+    }
+
+    #[test]
+    fn watch_is_rejected_once_a_transaction_is_open() {
+        let srv = server();
+        let mut s = Session::default();
+        handle_command(cmd(&["MULTI"]), &srv, &mut s);
+        assert_eq!(
+            handle_command(cmd(&["WATCH", "k"]), &srv, &mut s),
+            Value::Error("ERR WATCH inside MULTI is not allowed".to_string())
+        );
+    }
+
+    #[test]
+    fn exec_unwatches_so_a_later_transaction_is_unguarded() {
+        let srv = server();
+        let mut watcher = Session::default();
+        handle_command(cmd(&["SET", "k", "1"]), &srv, &mut watcher);
+        handle_command(cmd(&["WATCH", "k"]), &srv, &mut watcher);
+        handle_command(cmd(&["MULTI"]), &srv, &mut watcher);
+        handle_command(cmd(&["EXEC"]), &srv, &mut watcher);
+
+        // A concurrent write to k after the first EXEC must not haunt the second
+        // transaction — EXEC should have cleared the watch set.
+        let mut other = Session::default();
+        handle_command(cmd(&["SET", "k", "2"]), &srv, &mut other);
+
+        handle_command(cmd(&["MULTI"]), &srv, &mut watcher);
+        handle_command(cmd(&["SET", "k", "3"]), &srv, &mut watcher);
+        assert_eq!(
+            handle_command(cmd(&["EXEC"]), &srv, &mut watcher),
+            Value::Array(vec![Value::SimpleString("OK".to_string())])
+        );
+    }
+
+    #[test]
+    fn del_bumps_the_version_of_every_key_it_removes() {
+        let srv = server();
+        handle_command(cmd(&["SET", "a", "1"]), &srv, &mut Session::default());
+        handle_command(cmd(&["SET", "b", "1"]), &srv, &mut Session::default());
+        let (va, vb) = (srv.version_of("a"), srv.version_of("b"));
+
+        handle_command(cmd(&["DEL", "a", "b"]), &srv, &mut Session::default());
+        assert!(srv.version_of("a") > va);
+        assert!(srv.version_of("b") > vb);
     }
 
     #[test]
