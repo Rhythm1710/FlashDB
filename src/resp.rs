@@ -235,6 +235,26 @@ impl RespHandler {
     pub fn into_inner(self) -> TcpStream {
         self.stream
     }
+
+    /// Consume the handler and hand back *both* the raw stream and whatever
+    /// bytes are still buffered but not yet parsed.
+    ///
+    /// Unlike [`into_inner`](Self::into_inner), this keeps the leftover buffer.
+    /// The pub/sub subscriber loop takes the connection over this way, does its
+    /// own reads while forwarding pushed messages, and can hand the pieces back
+    /// via [`from_parts`](Self::from_parts) when the client leaves subscribe
+    /// mode — so a command a client pipelined right after `SUBSCRIBE` (or right
+    /// after the final `UNSUBSCRIBE`) is never lost.
+    pub fn into_parts(self) -> (TcpStream, BytesMut) {
+        (self.stream, self.buffer)
+    }
+
+    /// Rebuild a handler from a stream and a pre-filled buffer — the inverse of
+    /// [`into_parts`](Self::into_parts). The buffered bytes are parsed before
+    /// the next socket read, so nothing already received is dropped.
+    pub fn from_parts(stream: TcpStream, buffer: BytesMut) -> Self {
+        RespHandler { stream, buffer }
+    }
 }
 
 #[cfg(test)]
