@@ -993,3 +993,112 @@ async fn watch_lets_exec_commit_when_the_key_is_untouched() {
     send(&mut client, b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n").await;
     expect_reply(&mut client, "$1\r\n2\r\n").await;
 }
+
+// ----- Pub/Sub ---------------------------------------------------------------
+
+#[tokio::test]
+async fn publish_delivers_a_message_to_a_subscriber() {
+    let addr = start_server().await;
+
+    // One connection subscribes and reads its subscribe confirmation. Awaiting
+    // that reply guarantees the server has registered us before we publish.
+    let mut sub = connect(addr).await;
+    send(&mut sub, b"*2\r\n$9\r\nSUBSCRIBE\r\n$4\r\nnews\r\n").await;
+    expect_reply(&mut sub, "*3\r\n$9\r\nsubscribe\r\n$4\r\nnews\r\n:1\r\n").await;
+
+    // A second connection publishes; it learns one client received the message.
+    let mut pubr = connect(addr).await;
+    send(
+        &mut pubr,
+        b"*3\r\n$7\r\nPUBLISH\r\n$4\r\nnews\r\n$5\r\nhello\r\n",
+    )
+    .await;
+    expect_reply(&mut pubr, ":1\r\n").await;
+
+    // The subscriber is pushed the message frame without having asked for it.
+    expect_reply(
+        &mut sub,
+        "*3\r\n$7\r\nmessage\r\n$4\r\nnews\r\n$5\r\nhello\r\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn publish_to_a_channel_with_no_subscribers_returns_zero() {
+    let addr = start_server().await;
+    let mut client = connect(addr).await;
+    send(
+        &mut client,
+        b"*3\r\n$7\r\nPUBLISH\r\n$5\r\nempty\r\n$2\r\nhi\r\n",
+    )
+    .await;
+    expect_reply(&mut client, ":0\r\n").await;
+}
+
+#[tokio::test]
+async fn a_subscribed_client_may_not_run_ordinary_commands() {
+    let addr = start_server().await;
+    let mut sub = connect(addr).await;
+    send(&mut sub, b"*2\r\n$9\r\nSUBSCRIBE\r\n$4\r\nnews\r\n").await;
+    expect_reply(&mut sub, "*3\r\n$9\r\nsubscribe\r\n$4\r\nnews\r\n:1\r\n").await;
+
+    // GET is refused while in subscribe mode.
+    send(&mut sub, b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n").await;
+    expect_reply(
+        &mut sub,
+        "-ERR Can't execute 'get': only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT are allowed in this context\r\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn unsubscribing_from_everything_returns_the_connection_to_normal_mode() {
+    let addr = start_server().await;
+    let mut client = connect(addr).await;
+
+    send(&mut client, b"*2\r\n$9\r\nSUBSCRIBE\r\n$4\r\nnews\r\n").await;
+    expect_reply(&mut client, "*3\r\n$9\r\nsubscribe\r\n$4\r\nnews\r\n:1\r\n").await;
+
+    // Leaving the last channel drops the count to zero and exits subscribe mode.
+    send(&mut client, b"*2\r\n$11\r\nUNSUBSCRIBE\r\n$4\r\nnews\r\n").await;
+    expect_reply(
+        &mut client,
+        "*3\r\n$11\r\nunsubscribe\r\n$4\r\nnews\r\n:0\r\n",
+    )
+    .await;
+
+    // Back in ordinary request/response mode: a plain command works again.
+    send(
+        &mut client,
+        b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n",
+    )
+    .await;
+    expect_reply(&mut client, "+OK\r\n").await;
+    send(&mut client, b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n").await;
+    expect_reply(&mut client, "$3\r\nbar\r\n").await;
+}
+
+#[tokio::test]
+async fn a_message_reaches_every_subscriber_of_a_channel() {
+    let addr = start_server().await;
+
+    let mut sub1 = connect(addr).await;
+    send(&mut sub1, b"*2\r\n$9\r\nSUBSCRIBE\r\n$4\r\nchat\r\n").await;
+    expect_reply(&mut sub1, "*3\r\n$9\r\nsubscribe\r\n$4\r\nchat\r\n:1\r\n").await;
+
+    let mut sub2 = connect(addr).await;
+    send(&mut sub2, b"*2\r\n$9\r\nSUBSCRIBE\r\n$4\r\nchat\r\n").await;
+    expect_reply(&mut sub2, "*3\r\n$9\r\nsubscribe\r\n$4\r\nchat\r\n:1\r\n").await;
+
+    let mut pubr = connect(addr).await;
+    send(
+        &mut pubr,
+        b"*3\r\n$7\r\nPUBLISH\r\n$4\r\nchat\r\n$2\r\nyo\r\n",
+    )
+    .await;
+    expect_reply(&mut pubr, ":2\r\n").await;
+
+    let frame = "*3\r\n$7\r\nmessage\r\n$4\r\nchat\r\n$2\r\nyo\r\n";
+    expect_reply(&mut sub1, frame).await;
+    expect_reply(&mut sub2, frame).await;
+}

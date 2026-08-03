@@ -75,6 +75,9 @@ starting.
 - `DISCARD`
 - `WATCH key [key ...]`
 - `UNWATCH`
+- `SUBSCRIBE channel [channel ...]`
+- `UNSUBSCRIBE [channel ...]`
+- `PUBLISH channel message`
 
 ## Transactions
 
@@ -103,6 +106,30 @@ Transaction state (the queue and the watch set) lives per-connection, not in
 the shared keyspace, so two clients can run independent transactions at once.
 Writes inside a transaction replicate to replicas exactly as they would outside
 one.
+
+## Pub/Sub
+
+FlashDB supports Redis's publish/subscribe messaging. `SUBSCRIBE channel
+[channel ...]` puts a connection into **subscribe mode** and registers it as a
+listener on each channel; the server confirms each with a `[subscribe, channel,
+count]` frame, where `count` is how many channels the connection now holds.
+`PUBLISH channel message`, sent from any other connection, delivers `[message,
+channel, payload]` to every subscriber of that channel and returns the number
+that received it. `UNSUBSCRIBE [channel ...]` leaves the named channels, or
+every channel when given none; once the last subscription is dropped the
+connection returns to ordinary request/response mode.
+
+While subscribed, a connection is half push, half request/response: the server
+may send it a message at any moment, and it may still `SUBSCRIBE`,
+`UNSUBSCRIBE`, or `PING`. Any other command is refused with an error, matching
+Redis's RESP2 rule that a subscribed client can only manage its subscriptions.
+The channel routing table lives on the shared server (channel → the set of
+subscribed connections), while each connection tracks its own channel set on its
+task — the same shared-registry-plus-per-connection-state split that replication
+and transactions use.
+
+Not yet implemented: pattern subscriptions (`PSUBSCRIBE`/`PUNSUBSCRIBE`),
+`PUBSUB` introspection, and propagating `PUBLISH` across a replication link.
 
 ## Value types
 
