@@ -367,6 +367,11 @@ pub mod write {
             StoredValue::Str(_) => TYPE_STRING,
             StoredValue::List(_) => TYPE_LIST,
             StoredValue::Hash(_) => TYPE_HASH,
+            // Streams are filtered out before serialization (see
+            // `map_to_rdb_entries`); this arm satisfies the exhaustiveness
+            // checker and is never reached. We tag it as the string type purely
+            // so the function stays total — no stream record is ever emitted.
+            StoredValue::Stream(_) => TYPE_STRING,
         }
     }
 
@@ -390,6 +395,10 @@ pub mod write {
                     write_string(buf, value);
                 }
             }
+            // Unreachable: streams are dropped from the entry list before
+            // serialization, so `write_payload` is never handed one. Writing
+            // nothing keeps the function total without emitting a bogus record.
+            StoredValue::Stream(_) => {}
         }
     }
 

@@ -20,6 +20,9 @@ use tokio::sync::mpsc;
 pub mod rdb;
 pub mod replication;
 pub mod resp;
+pub mod stream;
+
+use stream::Stream;
 
 /// The typed payload a key holds.
 ///
@@ -43,6 +46,10 @@ pub enum StoredValue {
     /// order isn't preserved, so `HGETALL` returns pairs in an arbitrary order
     /// (real Redis makes no ordering promise for small hashes either).
     Hash(HashMap<String, String>),
+    /// A stream: an append-only log of entries keyed by a monotonically
+    /// increasing `<ms>-<seq>` ID (see [`crate::stream`]). This is the fourth
+    /// value type; `Set` is still to come.
+    Stream(Stream),
 }
 
 impl StoredValue {
@@ -54,6 +61,7 @@ impl StoredValue {
             StoredValue::Str(_) => "string",
             StoredValue::List(_) => "list",
             StoredValue::Hash(_) => "hash",
+            StoredValue::Stream(_) => "stream",
         }
     }
 }
@@ -272,6 +280,14 @@ fn map_to_rdb_entries(
     for (key, entry) in map {
         if entry.is_expired_at(now) {
             continue; // a key that has already lapsed is not worth persisting
+        }
+        if matches!(entry.value, StoredValue::Stream(_)) {
+            // Real Redis persists streams with a listpack/radix-tree encoding we
+            // neither write nor read yet, so a stream is skipped rather than
+            // emitted in a format a real `redis-server` couldn't load. (This
+            // filter is the single source of truth; the exhaustive arms in
+            // `rdb::write` exist only for the type system and never run.)
+            continue;
         }
         let expire_at_ms = entry.expires_at.map(|deadline| {
             // How far the deadline sits ahead of `now` on the monotonic clock,
@@ -1193,6 +1209,8 @@ pub fn process_command(value: Value, server: &Server) -> Value {
         "hget" => hget(&args, storage),
         "hgetall" => hgetall(&args, storage),
         "hdel" => hdel(&args, storage),
+        "xadd" => xadd(&args, storage),
+        "xlen" => xlen(&args, storage),
         "save" => save(&args, server),
         "bgsave" => bgsave(&args, server),
         // A replica announces its listening port and capabilities with REPLCONF
@@ -1271,6 +1289,7 @@ fn is_write_command(name: &str) -> bool {
             | "lpop"
             | "hset"
             | "hdel"
+            | "xadd"
     )
 }
 
@@ -1851,6 +1870,105 @@ fn hdel(args: &[Value], storage: &Store) -> Value {
     Value::Integer(removed)
 }
 
+/// `XADD key <id> field value [field value ...]` — append an entry to a stream,
+/// creating the stream if the key is absent. `<id>` is `*` (fully auto),
+/// `<ms>-*` / `<ms>` (auto sequence), or an explicit `<ms>-<seq>`; the resolved
+/// ID must be strictly greater than the stream's current top ID. Replies with
+/// the ID actually stored (a bulk string), or an error on a wrong-typed key, a
+/// bad ID, or an ID that isn't large enough.
+fn xadd(args: &[Value], storage: &Store) -> Value {
+    // key + id + at least one field/value pair.
+    if args.len() < 4 {
+        return wrong_args("xadd");
+    }
+    let field_value_args = &args[2..];
+    if !field_value_args.len().is_multiple_of(2) {
+        return wrong_args("xadd");
+    }
+    let key = match unpack_bulk_str(&args[0]) {
+        Ok(k) => k,
+        Err(e) => return Value::Error(format!("ERR {}", e)),
+    };
+    let id_arg = match unpack_bulk_str(&args[1]) {
+        Ok(s) => s,
+        Err(e) => return Value::Error(format!("ERR {}", e)),
+    };
+    let request = match stream::parse_xadd_id(&id_arg) {
+        Ok(req) => req,
+        Err(e) => return Value::Error(e),
+    };
+    let mut fields = Vec::with_capacity(field_value_args.len() / 2);
+    for pair in field_value_args.chunks(2) {
+        let field = match unpack_bulk_str(&pair[0]) {
+            Ok(f) => f,
+            Err(e) => return Value::Error(format!("ERR {}", e)),
+        };
+        let value = match unpack_bulk_str(&pair[1]) {
+            Ok(v) => v,
+            Err(e) => return Value::Error(format!("ERR {}", e)),
+        };
+        fields.push((field, value));
+    }
+
+    let now = Instant::now();
+    let now_ms = now_unix_ms();
+    let mut store = storage.lock().unwrap();
+    expire_if_due(&mut store, &key, now);
+
+    // Look before inserting: resolving an auto ID needs the stream's current
+    // `last_id`, and validation may reject the request — in which case we must
+    // not have created an empty stream. So we borrow any existing entry first,
+    // compute and check the ID, and only insert a fresh stream once the ID is
+    // known good.
+    let last_id = match store.get(&key) {
+        None => stream::StreamId::MIN,
+        Some(e) => match &e.value {
+            StoredValue::Stream(s) => s.last_id,
+            _ => return wrong_type(),
+        },
+    };
+    let id = match stream::resolve_id(request, last_id, now_ms) {
+        Ok(id) => id,
+        Err(e) => return Value::Error(e),
+    };
+
+    let entry = store.entry(key).or_insert_with(|| Entry {
+        value: StoredValue::Stream(Stream::default()),
+        expires_at: None,
+    });
+    match &mut entry.value {
+        StoredValue::Stream(s) => {
+            s.append(id, fields);
+            Value::BulkString(id.to_string())
+        }
+        // The pre-check above already returned WRONGTYPE for a non-stream key,
+        // so this arm is only reachable for a key we just created as a stream.
+        _ => wrong_type(),
+    }
+}
+
+/// `XLEN key` — the number of entries in the stream at `key`, `0` if the key is
+/// missing, or `WRONGTYPE` if it holds another type.
+fn xlen(args: &[Value], storage: &Store) -> Value {
+    if args.len() != 1 {
+        return wrong_args("xlen");
+    }
+    let key = match unpack_bulk_str(&args[0]) {
+        Ok(k) => k,
+        Err(e) => return Value::Error(format!("ERR {}", e)),
+    };
+    let now = Instant::now();
+    let mut store = storage.lock().unwrap();
+    expire_if_due(&mut store, &key, now);
+    match store.get(&key) {
+        None => Value::Integer(0),
+        Some(e) => match &e.value {
+            StoredValue::Stream(s) => Value::Integer(s.entries.len() as i64),
+            _ => wrong_type(),
+        },
+    }
+}
+
 fn wrong_args(cmd: &str) -> Value {
     Value::Error(format!(
         "ERR wrong number of arguments for '{}' command",
@@ -1942,12 +2060,13 @@ mod tests {
     fn write_commands_are_classified_for_replication() {
         for w in [
             "set", "del", "expire", "persist", "rpush", "lpush", "rpop", "lpop", "hset", "hdel",
+            "xadd",
         ] {
             assert!(is_write_command(w), "{w} should replicate");
         }
         for r in [
             "get", "ttl", "type", "llen", "lrange", "hget", "hgetall", "ping", "echo", "save",
-            "bgsave", "wait", "replconf", "psync",
+            "bgsave", "wait", "replconf", "psync", "xlen",
         ] {
             assert!(!is_write_command(r), "{r} should not replicate");
         }
@@ -2014,6 +2133,73 @@ mod tests {
     // shape `handle_command`/`process_command` expect.
     fn cmd(parts: &[&str]) -> Value {
         Value::Array(parts.iter().map(|p| bulk(p)).collect())
+    }
+
+    #[test]
+    fn xadd_with_explicit_ids_stores_and_returns_them() {
+        let st = store();
+        assert_eq!(
+            xadd(&[bulk("s"), bulk("1-1"), bulk("f"), bulk("v")], &st),
+            Value::BulkString("1-1".to_string())
+        );
+        assert_eq!(
+            xadd(&[bulk("s"), bulk("1-2"), bulk("f"), bulk("v")], &st),
+            Value::BulkString("1-2".to_string())
+        );
+        assert_eq!(xlen(&[bulk("s")], &st), Value::Integer(2));
+        assert_eq!(
+            type_cmd(&[bulk("s")], &st),
+            Value::SimpleString("stream".to_string())
+        );
+    }
+
+    #[test]
+    fn xadd_rejects_a_non_increasing_id() {
+        let st = store();
+        xadd(&[bulk("s"), bulk("5-5"), bulk("f"), bulk("v")], &st);
+        // Equal or smaller than the top item is refused...
+        assert!(matches!(
+            xadd(&[bulk("s"), bulk("5-5"), bulk("f"), bulk("v")], &st),
+            Value::Error(_)
+        ));
+        assert!(matches!(
+            xadd(&[bulk("s"), bulk("5-4"), bulk("f"), bulk("v")], &st),
+            Value::Error(_)
+        ));
+        // ...and the failed adds didn't change the stream.
+        assert_eq!(xlen(&[bulk("s")], &st), Value::Integer(1));
+    }
+
+    #[test]
+    fn xadd_auto_sequence_increments_within_a_millisecond() {
+        let st = store();
+        assert_eq!(
+            xadd(&[bulk("s"), bulk("5-*"), bulk("f"), bulk("v")], &st),
+            Value::BulkString("5-0".to_string())
+        );
+        assert_eq!(
+            xadd(&[bulk("s"), bulk("5-*"), bulk("f"), bulk("v")], &st),
+            Value::BulkString("5-1".to_string())
+        );
+    }
+
+    #[test]
+    fn xadd_rejects_zero_id_and_wrong_type() {
+        let st = store();
+        assert!(matches!(
+            xadd(&[bulk("s"), bulk("0-0"), bulk("f"), bulk("v")], &st),
+            Value::Error(_)
+        ));
+        // A string key can't take XADD, and the string is left intact.
+        set(&[bulk("str"), bulk("hi")], &st);
+        assert_eq!(
+            xadd(&[bulk("str"), bulk("1-1"), bulk("f"), bulk("v")], &st),
+            wrong_type()
+        );
+        assert_eq!(
+            get(&[bulk("str")], &st),
+            Value::BulkString("hi".to_string())
+        );
     }
 
     #[test]
