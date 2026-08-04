@@ -1221,3 +1221,51 @@ async fn xread_returns_entries_after_an_id_over_tcp() {
     .await;
     expect_reply(&mut client, "*-1\r\n").await;
 }
+
+#[tokio::test]
+async fn xread_block_times_out_to_nil_over_tcp() {
+    let addr = start_server().await;
+    let mut client = connect(addr).await;
+
+    // BLOCK 50ms on an empty stream with no writer: the read parks briefly, then
+    // gives up with a nil array rather than an empty one.
+    send(
+        &mut client,
+        b"*6\r\n$5\r\nXREAD\r\n$5\r\nBLOCK\r\n$2\r\n50\r\n$7\r\nSTREAMS\r\n$1\r\ns\r\n$1\r\n$\r\n",
+    )
+    .await;
+    expect_reply(&mut client, "*-1\r\n").await;
+}
+
+#[tokio::test]
+async fn xread_block_wakes_on_another_clients_write_over_tcp() {
+    let addr = start_server().await;
+    let mut reader = connect(addr).await;
+    let mut writer = connect(addr).await;
+
+    // The reader blocks forever (BLOCK 0) on a not-yet-existent stream with `$`,
+    // meaning "only entries added after now".
+    send(
+        &mut reader,
+        b"*6\r\n$5\r\nXREAD\r\n$5\r\nBLOCK\r\n$1\r\n0\r\n$7\r\nSTREAMS\r\n$1\r\ns\r\n$1\r\n$\r\n",
+    )
+    .await;
+
+    // Let the reader actually park before the write lands, so `$` is resolved
+    // against the empty stream and the new entry counts as newer.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // A second client appends an entry, which should wake the blocked reader.
+    send(
+        &mut writer,
+        b"*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n1-1\r\n$1\r\nk\r\n$1\r\nv\r\n",
+    )
+    .await;
+    expect_reply(&mut writer, "$3\r\n1-1\r\n").await;
+
+    // The reader is delivered the freshly-added entry.
+    let expected = "*1\r\n\
+        *2\r\n$1\r\ns\r\n\
+        *1\r\n*2\r\n$3\r\n1-1\r\n*2\r\n$1\r\nk\r\n$1\r\nv\r\n";
+    expect_reply(&mut reader, expected).await;
+}
