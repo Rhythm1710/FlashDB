@@ -1102,3 +1102,122 @@ async fn a_message_reaches_every_subscriber_of_a_channel() {
     expect_reply(&mut sub1, frame).await;
     expect_reply(&mut sub2, frame).await;
 }
+
+#[tokio::test]
+async fn xadd_then_xlen_and_type_over_tcp() {
+    let addr = start_server().await;
+    let mut client = connect(addr).await;
+
+    // XADD stream 1-1 field hello -> "1-1"
+    send(
+        &mut client,
+        b"*5\r\n$4\r\nXADD\r\n$6\r\nstream\r\n$3\r\n1-1\r\n$5\r\nfield\r\n$5\r\nhello\r\n",
+    )
+    .await;
+    expect_reply(&mut client, "$3\r\n1-1\r\n").await;
+
+    // A second entry with an auto sequence in the same millisecond -> "1-2".
+    send(
+        &mut client,
+        b"*5\r\n$4\r\nXADD\r\n$6\r\nstream\r\n$3\r\n1-*\r\n$5\r\nfield\r\n$5\r\nworld\r\n",
+    )
+    .await;
+    expect_reply(&mut client, "$3\r\n1-2\r\n").await;
+
+    // XLEN stream -> 2
+    send(&mut client, b"*2\r\n$4\r\nXLEN\r\n$6\r\nstream\r\n").await;
+    expect_reply(&mut client, ":2\r\n").await;
+
+    // TYPE stream -> stream
+    send(&mut client, b"*2\r\n$4\r\nTYPE\r\n$6\r\nstream\r\n").await;
+    expect_reply(&mut client, "+stream\r\n").await;
+}
+
+#[tokio::test]
+async fn xadd_rejects_a_non_increasing_id_over_tcp() {
+    let addr = start_server().await;
+    let mut client = connect(addr).await;
+
+    send(
+        &mut client,
+        b"*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n5-5\r\n$1\r\nf\r\n$1\r\nv\r\n",
+    )
+    .await;
+    expect_reply(&mut client, "$3\r\n5-5\r\n").await;
+
+    // The same ID again is refused with the Redis error string.
+    send(
+        &mut client,
+        b"*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n5-5\r\n$1\r\nf\r\n$1\r\nv\r\n",
+    )
+    .await;
+    expect_reply(
+        &mut client,
+        "-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn xrange_returns_entries_in_order_over_tcp() {
+    let addr = start_server().await;
+    let mut client = connect(addr).await;
+
+    for id in ["1-0", "2-0", "3-0"] {
+        let frame = format!(
+            "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n${}\r\n{}\r\n$1\r\nk\r\n$1\r\nv\r\n",
+            id.len(),
+            id
+        );
+        send(&mut client, frame.as_bytes()).await;
+        let reply = format!("${}\r\n{}\r\n", id.len(), id);
+        expect_reply(&mut client, &reply).await;
+    }
+
+    // XRANGE s 2 + -> the 2-0 and 3-0 entries as [id, [field, value]].
+    send(
+        &mut client,
+        b"*4\r\n$6\r\nXRANGE\r\n$1\r\ns\r\n$1\r\n2\r\n$1\r\n+\r\n",
+    )
+    .await;
+    let expected = "*2\r\n\
+        *2\r\n$3\r\n2-0\r\n*2\r\n$1\r\nk\r\n$1\r\nv\r\n\
+        *2\r\n$3\r\n3-0\r\n*2\r\n$1\r\nk\r\n$1\r\nv\r\n";
+    expect_reply(&mut client, expected).await;
+}
+
+#[tokio::test]
+async fn xread_returns_entries_after_an_id_over_tcp() {
+    let addr = start_server().await;
+    let mut client = connect(addr).await;
+
+    for id in ["1-0", "2-0"] {
+        let frame = format!(
+            "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n${}\r\n{}\r\n$1\r\nk\r\n$1\r\nv\r\n",
+            id.len(),
+            id
+        );
+        send(&mut client, frame.as_bytes()).await;
+        let reply = format!("${}\r\n{}\r\n", id.len(), id);
+        expect_reply(&mut client, &reply).await;
+    }
+
+    // XREAD STREAMS s 1-0 -> one stream, one entry (2-0).
+    send(
+        &mut client,
+        b"*4\r\n$5\r\nXREAD\r\n$7\r\nSTREAMS\r\n$1\r\ns\r\n$3\r\n1-0\r\n",
+    )
+    .await;
+    let expected = "*1\r\n\
+        *2\r\n$1\r\ns\r\n\
+        *1\r\n*2\r\n$3\r\n2-0\r\n*2\r\n$1\r\nk\r\n$1\r\nv\r\n";
+    expect_reply(&mut client, expected).await;
+
+    // Nothing newer than the end: nil array.
+    send(
+        &mut client,
+        b"*4\r\n$5\r\nXREAD\r\n$7\r\nSTREAMS\r\n$1\r\ns\r\n$1\r\n$\r\n",
+    )
+    .await;
+    expect_reply(&mut client, "*-1\r\n").await;
+}
