@@ -78,6 +78,10 @@ starting.
 - `SUBSCRIBE channel [channel ...]`
 - `UNSUBSCRIBE [channel ...]`
 - `PUBLISH channel message`
+- `XADD key <id> field value [field value ...]`
+- `XLEN key`
+- `XRANGE key start end [COUNT count]`
+- `XREAD [COUNT count] STREAMS key [key ...] id [id ...]`
 
 ## Transactions
 
@@ -131,14 +135,51 @@ and transactions use.
 Not yet implemented: pattern subscriptions (`PSUBSCRIBE`/`PUNSUBSCRIBE`),
 `PUBSUB` introspection, and propagating `PUBLISH` across a replication link.
 
+## Streams
+
+A **stream** is an append-only log of entries. Each entry has a unique,
+monotonically increasing ID of the form `<ms>-<seq>` (a millisecond timestamp
+and a per-millisecond sequence counter) and a set of field/value pairs.
+
+`XADD key <id> field value [field value ...]` appends an entry and returns the
+ID it was stored under. The `<id>` may be:
+
+- `*` — both parts auto-generated (the millisecond comes from the clock, or the
+  last entry's millisecond if the clock hasn't advanced, and the sequence is the
+  next free one);
+- `<ms>-*` or a bare `<ms>` — the millisecond is fixed and the sequence is
+  auto-generated;
+- `<ms>-<seq>` — a fully explicit ID.
+
+The resolved ID must be strictly greater than the stream's current top ID (and
+greater than `0-0`), otherwise `XADD` errors and the stream is left untouched.
+
+`XLEN key` returns the number of entries. `XRANGE key start end [COUNT count]`
+returns the entries whose IDs fall in the inclusive range `[start, end]`; the
+bounds accept `-` and `+` (the smallest and largest possible IDs), a bare
+`<ms>` (which covers the whole millisecond), or a full `<ms>-<seq>`, and
+`COUNT` caps how many entries come back. Each entry is returned as
+`[id, [field, value, ...]]`.
+
+`XREAD [COUNT count] STREAMS key [key ...] id [id ...]` reads entries newer than
+a given ID from one or more streams at once: it returns, for each stream that
+has anything, `[key, [entries...]]` with the entries whose IDs are strictly
+greater than the paired `id`. An `id` of `$` means "only entries newer than the
+current end", so a non-blocking `XREAD` on `$` returns nothing. When no stream
+has new entries the reply is the nil array.
+
+Streams are not yet persisted to RDB (real Redis uses a listpack/radix-tree
+encoding FlashDB does not emit yet), and blocking `XREAD ... BLOCK` and the
+consumer-group commands (`XACK`/`XCLAIM`/…) are still to come.
+
 ## Value types
 
-Every key holds a typed value — a `string`, a `list`, or a `hash` today, with
-sets to follow. Values are modelled as an enum, so a command that meets the
-wrong type (say `GET` on a list, or `LPUSH` on a string) replies with a
-`WRONGTYPE` error instead of misbehaving. `TYPE key` reports the kind of value
-stored: `string`, `list`, `hash`, or `none` if the key is missing or has
-expired.
+Every key holds a typed value — a `string`, a `list`, a `hash`, or a `stream`
+today, with sets to follow. Values are modelled as an enum, so a command that
+meets the wrong type (say `GET` on a list, or `LPUSH` on a string) replies with
+a `WRONGTYPE` error instead of misbehaving. `TYPE key` reports the kind of value
+stored: `string`, `list`, `hash`, `stream`, or `none` if the key is missing or
+has expired.
 
 ## Lists
 

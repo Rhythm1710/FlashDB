@@ -1211,6 +1211,8 @@ pub fn process_command(value: Value, server: &Server) -> Value {
         "hdel" => hdel(&args, storage),
         "xadd" => xadd(&args, storage),
         "xlen" => xlen(&args, storage),
+        "xrange" => xrange(&args, storage),
+        "xread" => xread(&args, storage),
         "save" => save(&args, server),
         "bgsave" => bgsave(&args, server),
         // A replica announces its listening port and capabilities with REPLCONF
@@ -1969,6 +1971,188 @@ fn xlen(args: &[Value], storage: &Store) -> Value {
     }
 }
 
+/// Render one stream entry as the RESP shape Redis uses: a two-element array of
+/// `[id, [field, value, field, value, ...]]`. Shared by `XRANGE` and `XREAD`.
+fn entry_to_value(entry: &stream::StreamEntry) -> Value {
+    let mut flat = Vec::with_capacity(entry.fields.len() * 2);
+    for (field, value) in &entry.fields {
+        flat.push(Value::BulkString(field.clone()));
+        flat.push(Value::BulkString(value.clone()));
+    }
+    Value::Array(vec![
+        Value::BulkString(entry.id.to_string()),
+        Value::Array(flat),
+    ])
+}
+
+/// `XRANGE key start end [COUNT n]` — the entries whose IDs fall in the
+/// inclusive range `[start, end]`. `start`/`end` accept `-`/`+` (the extremes),
+/// a bare `<ms>` (whole millisecond), or a full `<ms>-<seq>`. Replies with an
+/// array of `[id, [field, value, ...]]` entries (empty array for a missing
+/// key), or an error on a bad bound, bad `COUNT`, or a wrong-typed key.
+fn xrange(args: &[Value], storage: &Store) -> Value {
+    if args.len() != 3 && args.len() != 5 {
+        return wrong_args("xrange");
+    }
+    let key = match unpack_bulk_str(&args[0]) {
+        Ok(k) => k,
+        Err(e) => return Value::Error(format!("ERR {}", e)),
+    };
+    let start = match unpack_bulk_str(&args[1]).map_err(|e| format!("ERR {}", e)) {
+        Ok(s) => match stream::parse_range_start(&s) {
+            Ok(id) => id,
+            Err(e) => return Value::Error(e),
+        },
+        Err(e) => return Value::Error(e),
+    };
+    let end = match unpack_bulk_str(&args[2]).map_err(|e| format!("ERR {}", e)) {
+        Ok(s) => match stream::parse_range_end(&s) {
+            Ok(id) => id,
+            Err(e) => return Value::Error(e),
+        },
+        Err(e) => return Value::Error(e),
+    };
+    let count = match parse_optional_count(&args[3..]) {
+        Ok(c) => c,
+        Err(e) => return Value::Error(e),
+    };
+
+    let now = Instant::now();
+    let mut store = storage.lock().unwrap();
+    expire_if_due(&mut store, &key, now);
+    match store.get(&key) {
+        None => Value::Array(Vec::new()),
+        Some(e) => match &e.value {
+            StoredValue::Stream(s) => {
+                let entries = s.range(start, end, count);
+                Value::Array(entries.into_iter().map(entry_to_value).collect())
+            }
+            _ => wrong_type(),
+        },
+    }
+}
+
+/// Parse an optional trailing `COUNT n` clause (the slice after the fixed
+/// arguments). An empty slice means no count; `COUNT n` yields `Some(n)`;
+/// anything else is a syntax error.
+fn parse_optional_count(rest: &[Value]) -> Result<Option<usize>, String> {
+    if rest.is_empty() {
+        return Ok(None);
+    }
+    if rest.len() != 2 {
+        return Err("ERR syntax error".to_string());
+    }
+    let keyword = unpack_bulk_str(&rest[0]).map_err(|e| format!("ERR {}", e))?;
+    if !keyword.eq_ignore_ascii_case("count") {
+        return Err("ERR syntax error".to_string());
+    }
+    let n = unpack_bulk_str(&rest[1]).map_err(|e| format!("ERR {}", e))?;
+    let n = n
+        .parse::<usize>()
+        .map_err(|_| "ERR value is not an integer or out of range".to_string())?;
+    Ok(Some(n))
+}
+
+/// `XREAD [COUNT n] STREAMS key [key ...] id [id ...]` — for each named stream,
+/// the entries with an ID strictly greater than the paired `id`. A `$` id means
+/// "only entries added after now", which for this non-blocking read is always
+/// empty. Replies with an array of `[key, [entries...]]` for each stream that
+/// produced results, or a null array if none did. (Blocking `XREAD ... BLOCK`
+/// is deferred.)
+fn xread(args: &[Value], storage: &Store) -> Value {
+    // Optional leading `COUNT n`, then the mandatory `STREAMS` keyword.
+    let mut idx = 0;
+    let mut count: Option<usize> = None;
+    match args.first().and_then(|v| unpack_bulk_str(v).ok()) {
+        Some(word) if word.eq_ignore_ascii_case("count") => {
+            let Some(n_val) = args.get(1) else {
+                return Value::Error("ERR syntax error".to_string());
+            };
+            let n = match unpack_bulk_str(n_val).map_err(|e| format!("ERR {}", e)) {
+                Ok(s) => match s.parse::<usize>() {
+                    Ok(n) => n,
+                    Err(_) => {
+                        return Value::Error(
+                            "ERR value is not an integer or out of range".to_string(),
+                        )
+                    }
+                },
+                Err(e) => return Value::Error(e),
+            };
+            count = Some(n);
+            idx = 2;
+        }
+        _ => {}
+    }
+
+    match args.get(idx).and_then(|v| unpack_bulk_str(v).ok()) {
+        Some(word) if word.eq_ignore_ascii_case("streams") => idx += 1,
+        _ => return Value::Error("ERR syntax error, expected STREAMS in XREAD".to_string()),
+    }
+
+    // The remainder is N keys followed by N ids — so it must be non-empty and
+    // even. Split it down the middle.
+    let rest = &args[idx..];
+    if rest.is_empty() || !rest.len().is_multiple_of(2) {
+        return Value::Error(
+            "ERR Unbalanced XREAD list of streams: for each stream key an ID or '$' must be specified."
+                .to_string(),
+        );
+    }
+    let n = rest.len() / 2;
+    let (keys, ids) = rest.split_at(n);
+
+    let now = Instant::now();
+    let mut store = storage.lock().unwrap();
+    let mut results = Vec::new();
+    for (key_val, id_val) in keys.iter().zip(ids) {
+        let key = match unpack_bulk_str(key_val) {
+            Ok(k) => k,
+            Err(e) => return Value::Error(format!("ERR {}", e)),
+        };
+        let id_arg = match unpack_bulk_str(id_val) {
+            Ok(s) => s,
+            Err(e) => return Value::Error(format!("ERR {}", e)),
+        };
+        expire_if_due(&mut store, &key, now);
+
+        let stream_ref = match store.get(&key) {
+            None => continue, // a missing stream simply contributes no result
+            Some(e) => match &e.value {
+                StoredValue::Stream(s) => s,
+                _ => return wrong_type(),
+            },
+        };
+        // `$` means "from the current end" — nothing is newer in a non-blocking
+        // read. Otherwise the id is an exclusive lower bound.
+        let after = if id_arg == "$" {
+            stream_ref.last_id
+        } else {
+            match stream::parse_range_start(&id_arg) {
+                Ok(id) => id,
+                Err(e) => return Value::Error(e),
+            }
+        };
+        let entries = stream_ref.entries_after(after, count);
+        if entries.is_empty() {
+            continue;
+        }
+        let entry_values: Vec<Value> = entries.into_iter().map(entry_to_value).collect();
+        results.push(Value::Array(vec![
+            Value::BulkString(key),
+            Value::Array(entry_values),
+        ]));
+    }
+
+    if results.is_empty() {
+        // No stream had anything new: Redis answers a non-blocking XREAD with a
+        // nil (null array), not an empty array.
+        Value::NullArray
+    } else {
+        Value::Array(results)
+    }
+}
+
 fn wrong_args(cmd: &str) -> Value {
     Value::Error(format!(
         "ERR wrong number of arguments for '{}' command",
@@ -2066,7 +2250,7 @@ mod tests {
         }
         for r in [
             "get", "ttl", "type", "llen", "lrange", "hget", "hgetall", "ping", "echo", "save",
-            "bgsave", "wait", "replconf", "psync", "xlen",
+            "bgsave", "wait", "replconf", "psync", "xlen", "xrange", "xread",
         ] {
             assert!(!is_write_command(r), "{r} should not replicate");
         }
@@ -2199,6 +2383,68 @@ mod tests {
         assert_eq!(
             get(&[bulk("str")], &st),
             Value::BulkString("hi".to_string())
+        );
+    }
+
+    #[test]
+    fn xrange_returns_entries_in_the_inclusive_range() {
+        let st = store();
+        for id in ["1-0", "2-0", "3-0"] {
+            xadd(&[bulk("s"), bulk(id), bulk("k"), bulk(id)], &st);
+        }
+        // A bounded range picks up 2-0 and 3-0.
+        let reply = xrange(&[bulk("s"), bulk("2"), bulk("+")], &st);
+        let Value::Array(items) = reply else {
+            panic!("expected array");
+        };
+        assert_eq!(items.len(), 2);
+        assert_eq!(
+            items[0],
+            Value::Array(vec![
+                Value::BulkString("2-0".to_string()),
+                Value::Array(vec![bulk("k"), bulk("2-0")]),
+            ])
+        );
+
+        // COUNT caps the full range.
+        let reply = xrange(
+            &[bulk("s"), bulk("-"), bulk("+"), bulk("COUNT"), bulk("1")],
+            &st,
+        );
+        assert!(matches!(reply, Value::Array(ref v) if v.len() == 1));
+
+        // A missing key is an empty array, not an error.
+        assert_eq!(
+            xrange(&[bulk("nope"), bulk("-"), bulk("+")], &st),
+            Value::Array(vec![])
+        );
+    }
+
+    #[test]
+    fn xread_returns_only_entries_after_the_given_id() {
+        let st = store();
+        for id in ["1-0", "2-0", "3-0"] {
+            xadd(&[bulk("s"), bulk(id), bulk("k"), bulk(id)], &st);
+        }
+        // Everything strictly after 1-0.
+        let reply = xread(&[bulk("STREAMS"), bulk("s"), bulk("1-0")], &st);
+        let Value::Array(streams) = reply else {
+            panic!("expected array");
+        };
+        assert_eq!(streams.len(), 1);
+        let Value::Array(ref pair) = streams[0] else {
+            panic!("expected [key, entries]");
+        };
+        assert_eq!(pair[0], Value::BulkString("s".to_string()));
+        let Value::Array(ref entries) = pair[1] else {
+            panic!("expected entries array");
+        };
+        assert_eq!(entries.len(), 2); // 2-0 and 3-0
+
+        // `$` means "only newer than now" — nothing, so a nil array.
+        assert_eq!(
+            xread(&[bulk("STREAMS"), bulk("s"), bulk("$")], &st),
+            Value::NullArray
         );
     }
 
