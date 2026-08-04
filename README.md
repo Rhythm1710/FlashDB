@@ -81,7 +81,7 @@ starting.
 - `XADD key <id> field value [field value ...]`
 - `XLEN key`
 - `XRANGE key start end [COUNT count]`
-- `XREAD [COUNT count] STREAMS key [key ...] id [id ...]`
+- `XREAD [COUNT count] [BLOCK ms] STREAMS key [key ...] id [id ...]`
 
 ## Transactions
 
@@ -161,16 +161,25 @@ bounds accept `-` and `+` (the smallest and largest possible IDs), a bare
 `COUNT` caps how many entries come back. Each entry is returned as
 `[id, [field, value, ...]]`.
 
-`XREAD [COUNT count] STREAMS key [key ...] id [id ...]` reads entries newer than
-a given ID from one or more streams at once: it returns, for each stream that
-has anything, `[key, [entries...]]` with the entries whose IDs are strictly
-greater than the paired `id`. An `id` of `$` means "only entries newer than the
-current end", so a non-blocking `XREAD` on `$` returns nothing. When no stream
-has new entries the reply is the nil array.
+`XREAD [COUNT count] [BLOCK ms] STREAMS key [key ...] id [id ...]` reads entries
+newer than a given ID from one or more streams at once: it returns, for each
+stream that has anything, `[key, [entries...]]` with the entries whose IDs are
+strictly greater than the paired `id`. An `id` of `$` means "only entries newer
+than the current end". Without `BLOCK`, the read is non-blocking — if no stream
+has new entries the reply is the nil array (so `XREAD` on `$` returns nothing).
+
+With `BLOCK ms` the read instead *waits* for new entries: it resolves each `$`
+against the stream's current end at the moment blocking begins, and then parks
+until a matching `XADD` arrives (on any connection) or the timeout elapses.
+`BLOCK 0` waits indefinitely. If the timeout passes with nothing new the reply
+is the nil array. The wait is genuinely async — a blocked client uses no CPU and
+never holds the store lock while waiting, and a single `XADD` wakes every client
+blocked on that stream. Inside a `MULTI`/`EXEC` transaction a `BLOCK` is ignored
+(the queued read runs as a non-blocking pass), matching Redis.
 
 Streams are not yet persisted to RDB (real Redis uses a listpack/radix-tree
-encoding FlashDB does not emit yet), and blocking `XREAD ... BLOCK` and the
-consumer-group commands (`XACK`/`XCLAIM`/…) are still to come.
+encoding FlashDB does not emit yet), and the consumer-group commands
+(`XACK`/`XCLAIM`/…) are still to come.
 
 ## Value types
 
