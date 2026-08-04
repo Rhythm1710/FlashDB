@@ -15,7 +15,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
+use tokio::time::timeout;
 
 pub mod rdb;
 pub mod replication;
@@ -453,6 +454,11 @@ pub struct Server {
     replicas: Replicas,
     versions: Versions,
     subscribers: Subscribers,
+    /// Wakes any client parked in a blocking `XREAD ... BLOCK`. Every successful
+    /// `XADD` calls `notify_waiters()` on it; a blocked reader re-checks its
+    /// streams each time it fires. A single shared `Notify` (rather than one per
+    /// stream) is enough because a spurious wake just costs one extra re-check.
+    stream_notify: Arc<Notify>,
 }
 
 impl Server {
@@ -463,6 +469,7 @@ impl Server {
             replicas: Arc::new(Mutex::new(Vec::new())),
             versions: Arc::new(Mutex::new(HashMap::new())),
             subscribers: Arc::new(Mutex::new(HashMap::new())),
+            stream_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -802,6 +809,19 @@ async fn handle_conn(stream: TcpStream, server: Server) -> Result<()> {
             // the client pipelined after its final `UNSUBSCRIBE`.
             handler = resp::RespHandler::from_parts(stream, buffer);
             continue;
+        }
+
+        // A blocking `XREAD ... BLOCK` must be handled here, at the async layer,
+        // so it can actually park the task on a timer/notification instead of
+        // spinning inside the synchronous dispatch. Inside a transaction we skip
+        // this: Redis runs a queued blocking command as if it were non-blocking,
+        // so it falls through to `handle_command` like anything else.
+        if !session.in_multi {
+            if let Some(req) = as_blocking_xread(&value) {
+                let response = xread_blocking(req, &server).await;
+                handler.write_value(response).await?;
+                continue;
+            }
         }
 
         // A malformed request produces an error reply, not a dropped
@@ -1239,6 +1259,11 @@ pub fn process_command(value: Value, server: &Server) -> Value {
         // Bump the version of every key this write touched so a `WATCH` on it
         // elsewhere notices the change and aborts its `EXEC`.
         bump_versions(&server.versions, &name, &args);
+        // A successful `XADD` may satisfy a client parked in a blocking
+        // `XREAD ... BLOCK`; wake them all so each re-checks its streams.
+        if name == "xadd" {
+            server.stream_notify.notify_waiters();
+        }
     }
     response
 }
@@ -2053,104 +2078,243 @@ fn parse_optional_count(rest: &[Value]) -> Result<Option<usize>, String> {
     Ok(Some(n))
 }
 
-/// `XREAD [COUNT n] STREAMS key [key ...] id [id ...]` — for each named stream,
-/// the entries with an ID strictly greater than the paired `id`. A `$` id means
-/// "only entries added after now", which for this non-blocking read is always
-/// empty. Replies with an array of `[key, [entries...]]` for each stream that
-/// produced results, or a null array if none did. (Blocking `XREAD ... BLOCK`
-/// is deferred.)
-fn xread(args: &[Value], storage: &Store) -> Value {
-    // Optional leading `COUNT n`, then the mandatory `STREAMS` keyword.
+/// A parsed `XREAD` request: the optional `COUNT`/`BLOCK` modifiers plus the
+/// paired stream keys and their id specifications (kept as raw strings because a
+/// `$` can only be resolved against live stream state, and that resolution
+/// happens at a different moment for a blocking vs. a non-blocking read).
+#[derive(Debug)]
+struct XReadRequest {
+    /// `BLOCK <ms>` if present. `Some(0)` means block forever; `None` means the
+    /// classic non-blocking read.
+    block: Option<u64>,
+    /// `COUNT <n>` cap on entries returned per stream, if given.
+    count: Option<usize>,
+    /// The stream keys, in order.
+    keys: Vec<String>,
+    /// The id specifications paired with `keys` — a `$` or a concrete `<ms>`/
+    /// `<ms>-<seq>` bound, still unparsed.
+    id_specs: Vec<String>,
+}
+
+/// Parse the whole `XREAD [COUNT n] [BLOCK ms] STREAMS key... id...` argument
+/// list. `COUNT` and `BLOCK` may appear in either order before the mandatory
+/// `STREAMS` keyword; after it comes an equal, non-empty count of keys and ids.
+/// Returns the Redis error string on any malformed input.
+fn parse_xread(args: &[Value]) -> Result<XReadRequest, String> {
     let mut idx = 0;
     let mut count: Option<usize> = None;
-    match args.first().and_then(|v| unpack_bulk_str(v).ok()) {
-        Some(word) if word.eq_ignore_ascii_case("count") => {
-            let Some(n_val) = args.get(1) else {
-                return Value::Error("ERR syntax error".to_string());
-            };
-            let n = match unpack_bulk_str(n_val).map_err(|e| format!("ERR {}", e)) {
-                Ok(s) => match s.parse::<usize>() {
-                    Ok(n) => n,
-                    Err(_) => {
-                        return Value::Error(
-                            "ERR value is not an integer or out of range".to_string(),
-                        )
-                    }
-                },
-                Err(e) => return Value::Error(e),
-            };
+    let mut block: Option<u64> = None;
+
+    // Consume leading option words until we reach STREAMS. Each option takes one
+    // following value argument.
+    loop {
+        let word = match args.get(idx).and_then(|v| unpack_bulk_str(v).ok()) {
+            Some(w) => w,
+            None => return Err("ERR syntax error".to_string()),
+        };
+        if word.eq_ignore_ascii_case("streams") {
+            idx += 1;
+            break;
+        } else if word.eq_ignore_ascii_case("count") {
+            let n = args
+                .get(idx + 1)
+                .ok_or_else(|| "ERR syntax error".to_string())
+                .and_then(|v| unpack_bulk_str(v).map_err(|e| format!("ERR {}", e)))?
+                .parse::<usize>()
+                .map_err(|_| "ERR value is not an integer or out of range".to_string())?;
             count = Some(n);
-            idx = 2;
+            idx += 2;
+        } else if word.eq_ignore_ascii_case("block") {
+            let ms = args
+                .get(idx + 1)
+                .ok_or_else(|| "ERR syntax error".to_string())
+                .and_then(|v| unpack_bulk_str(v).map_err(|e| format!("ERR {}", e)))?
+                .parse::<u64>()
+                .map_err(|_| "ERR timeout is not an integer or out of range".to_string())?;
+            block = Some(ms);
+            idx += 2;
+        } else {
+            return Err("ERR syntax error, expected STREAMS in XREAD".to_string());
         }
-        _ => {}
     }
 
-    match args.get(idx).and_then(|v| unpack_bulk_str(v).ok()) {
-        Some(word) if word.eq_ignore_ascii_case("streams") => idx += 1,
-        _ => return Value::Error("ERR syntax error, expected STREAMS in XREAD".to_string()),
-    }
-
-    // The remainder is N keys followed by N ids — so it must be non-empty and
-    // even. Split it down the middle.
+    // The remainder is N keys followed by N ids — non-empty and even.
     let rest = &args[idx..];
     if rest.is_empty() || !rest.len().is_multiple_of(2) {
-        return Value::Error(
+        return Err(
             "ERR Unbalanced XREAD list of streams: for each stream key an ID or '$' must be specified."
                 .to_string(),
         );
     }
     let n = rest.len() / 2;
-    let (keys, ids) = rest.split_at(n);
+    let (key_vals, id_vals) = rest.split_at(n);
+    let mut keys = Vec::with_capacity(n);
+    let mut id_specs = Vec::with_capacity(n);
+    for (k, i) in key_vals.iter().zip(id_vals) {
+        keys.push(unpack_bulk_str(k).map_err(|e| format!("ERR {}", e))?);
+        id_specs.push(unpack_bulk_str(i).map_err(|e| format!("ERR {}", e))?);
+    }
+    Ok(XReadRequest {
+        block,
+        count,
+        keys,
+        id_specs,
+    })
+}
 
+/// Turn each `(key, id_spec)` into the concrete exclusive lower bound `XREAD`
+/// reads past. A `$` resolves to the stream's current `last_id` (the empty
+/// stream's `0-0` if it doesn't exist yet), which is what makes `$` mean "only
+/// what arrives after this moment". Any other spec is a range-start bound. A
+/// wrong-typed key aborts the whole read with `WRONGTYPE`. Needs `&mut` only to
+/// run passive expiry before reading.
+fn resolve_after_ids(
+    store: &mut HashMap<String, Entry>,
+    req: &XReadRequest,
+) -> Result<Vec<stream::StreamId>, Value> {
     let now = Instant::now();
-    let mut store = storage.lock().unwrap();
-    let mut results = Vec::new();
-    for (key_val, id_val) in keys.iter().zip(ids) {
-        let key = match unpack_bulk_str(key_val) {
-            Ok(k) => k,
-            Err(e) => return Value::Error(format!("ERR {}", e)),
-        };
-        let id_arg = match unpack_bulk_str(id_val) {
-            Ok(s) => s,
-            Err(e) => return Value::Error(format!("ERR {}", e)),
-        };
-        expire_if_due(&mut store, &key, now);
-
-        let stream_ref = match store.get(&key) {
-            None => continue, // a missing stream simply contributes no result
+    let mut afters = Vec::with_capacity(req.keys.len());
+    for (key, spec) in req.keys.iter().zip(&req.id_specs) {
+        expire_if_due(store, key, now);
+        let last_id = match store.get(key) {
+            None => stream::StreamId::MIN,
             Some(e) => match &e.value {
-                StoredValue::Stream(s) => s,
-                _ => return wrong_type(),
+                StoredValue::Stream(s) => s.last_id,
+                _ => return Err(wrong_type()),
             },
         };
-        // `$` means "from the current end" — nothing is newer in a non-blocking
-        // read. Otherwise the id is an exclusive lower bound.
-        let after = if id_arg == "$" {
-            stream_ref.last_id
+        let after = if spec == "$" {
+            last_id
         } else {
-            match stream::parse_range_start(&id_arg) {
-                Ok(id) => id,
-                Err(e) => return Value::Error(e),
-            }
+            stream::parse_range_start(spec).map_err(Value::Error)?
         };
-        let entries = stream_ref.entries_after(after, count);
+        afters.push(after);
+    }
+    Ok(afters)
+}
+
+/// Gather the reply for a set of already-resolved `after` bounds: for each
+/// stream that has entries strictly greater than its bound, a `[key, [entries]]`
+/// pair. Returns the nil array (`Value::NullArray`) when nothing is new, exactly
+/// as Redis does. Read-only — the caller holds the lock.
+fn xread_collect(
+    store: &HashMap<String, Entry>,
+    req: &XReadRequest,
+    afters: &[stream::StreamId],
+) -> Value {
+    let mut results = Vec::new();
+    for (key, after) in req.keys.iter().zip(afters) {
+        let stream_ref = match store.get(key) {
+            None => continue,
+            Some(e) => match &e.value {
+                StoredValue::Stream(s) => s,
+                // A key that was a stream at resolution time but isn't now would
+                // be unusual, but treat any non-stream as no contribution here;
+                // the WRONGTYPE was already reported during resolution.
+                _ => continue,
+            },
+        };
+        let entries = stream_ref.entries_after(*after, req.count);
         if entries.is_empty() {
             continue;
         }
         let entry_values: Vec<Value> = entries.into_iter().map(entry_to_value).collect();
         results.push(Value::Array(vec![
-            Value::BulkString(key),
+            Value::BulkString(key.clone()),
             Value::Array(entry_values),
         ]));
     }
-
     if results.is_empty() {
-        // No stream had anything new: Redis answers a non-blocking XREAD with a
-        // nil (null array), not an empty array.
         Value::NullArray
     } else {
         Value::Array(results)
     }
+}
+
+/// `XREAD [COUNT n] [BLOCK ms] STREAMS key [key ...] id [id ...]` — for each
+/// named stream, the entries with an ID strictly greater than the paired `id`.
+/// A `$` id means "only entries added after now". This is the synchronous entry
+/// point used for a non-blocking read (and for a `BLOCK` read replayed inside
+/// `EXEC`, where blocking is not allowed): it does a single pass and returns
+/// immediately, ignoring any `BLOCK`. The actual waiting lives in
+/// [`xread_blocking`], reached from the async connection loop.
+fn xread(args: &[Value], storage: &Store) -> Value {
+    let req = match parse_xread(args) {
+        Ok(r) => r,
+        Err(e) => return Value::Error(e),
+    };
+    let mut store = storage.lock().unwrap();
+    let afters = match resolve_after_ids(&mut store, &req) {
+        Ok(a) => a,
+        Err(v) => return v,
+    };
+    xread_collect(&store, &req, &afters)
+}
+
+/// The blocking variant of `XREAD`, run from the async connection loop so it can
+/// actually `.await`. The `$` bounds are resolved once, up front, against the
+/// stream state at the moment blocking begins — so we only see entries that
+/// arrive *after* that. Then we park until a write wakes us or the deadline
+/// passes, re-checking on each wake.
+async fn xread_blocking(req: XReadRequest, server: &Server) -> Value {
+    // Snapshot the bounds while holding the lock exactly once.
+    let afters = {
+        let mut store = server.store.lock().unwrap();
+        match resolve_after_ids(&mut store, &req) {
+            Ok(a) => a,
+            Err(v) => return v,
+        }
+    };
+
+    // `BLOCK 0` waits forever; otherwise compute an absolute deadline.
+    let deadline = match req.block {
+        Some(0) | None => None,
+        Some(ms) => Some(Instant::now() + Duration::from_millis(ms)),
+    };
+
+    loop {
+        // Register interest *before* checking the store. `notify_waiters()` does
+        // not store a permit, so a wake that lands between our check and our
+        // await would be lost — enabling the future now closes that race.
+        let notified = server.stream_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        {
+            let store = server.store.lock().unwrap();
+            let result = xread_collect(&store, &req, &afters);
+            if !matches!(result, Value::NullArray) {
+                return result;
+            }
+        }
+
+        match deadline {
+            None => notified.await,
+            Some(dl) => {
+                let now = Instant::now();
+                if now >= dl {
+                    return Value::NullArray;
+                }
+                // Woken (Ok) → loop and re-check; elapsed (Err) → timed out.
+                if timeout(dl - now, notified).await.is_err() {
+                    return Value::NullArray;
+                }
+            }
+        }
+    }
+}
+
+/// If `value` is an `XREAD` carrying a `BLOCK` clause, parse it into a request to
+/// be handled by the async blocking path. Returns `None` when it isn't an
+/// `XREAD`, when it has no `BLOCK`, or when it fails to parse — in those cases
+/// the caller lets the ordinary synchronous dispatch handle it (producing a
+/// non-blocking reply or the proper error).
+fn as_blocking_xread(value: &Value) -> Option<XReadRequest> {
+    if command_name(value).as_deref() != Some("xread") {
+        return None;
+    }
+    let req = parse_xread(command_args(value)).ok()?;
+    req.block.map(|_| req)
 }
 
 fn wrong_args(cmd: &str) -> Value {
@@ -2446,6 +2610,139 @@ mod tests {
             xread(&[bulk("STREAMS"), bulk("s"), bulk("$")], &st),
             Value::NullArray
         );
+    }
+
+    #[test]
+    fn parse_xread_reads_block_and_count_in_any_order() {
+        // BLOCK before COUNT.
+        let req = parse_xread(&[
+            bulk("BLOCK"),
+            bulk("100"),
+            bulk("COUNT"),
+            bulk("2"),
+            bulk("STREAMS"),
+            bulk("s"),
+            bulk("$"),
+        ])
+        .unwrap();
+        assert_eq!(req.block, Some(100));
+        assert_eq!(req.count, Some(2));
+        assert_eq!(req.keys, vec!["s".to_string()]);
+        assert_eq!(req.id_specs, vec!["$".to_string()]);
+
+        // COUNT before BLOCK, and BLOCK 0 (wait forever) parses to Some(0).
+        let req = parse_xread(&[
+            bulk("COUNT"),
+            bulk("5"),
+            bulk("BLOCK"),
+            bulk("0"),
+            bulk("STREAMS"),
+            bulk("a"),
+            bulk("b"),
+            bulk("0"),
+            bulk("0"),
+        ])
+        .unwrap();
+        assert_eq!(req.block, Some(0));
+        assert_eq!(req.count, Some(5));
+        assert_eq!(req.keys, vec!["a".to_string(), "b".to_string()]);
+
+        // A non-numeric BLOCK timeout is rejected with Redis's message.
+        let err = parse_xread(&[
+            bulk("BLOCK"),
+            bulk("soon"),
+            bulk("STREAMS"),
+            bulk("s"),
+            bulk("$"),
+        ])
+        .unwrap_err();
+        assert!(err.contains("timeout is not an integer"));
+    }
+
+    #[test]
+    fn as_blocking_xread_only_fires_for_a_block_clause() {
+        // A plain XREAD is not routed to the blocking path.
+        assert!(as_blocking_xread(&cmd(&["XREAD", "STREAMS", "s", "$"])).is_none());
+        // One with BLOCK is.
+        let req = as_blocking_xread(&cmd(&["XREAD", "BLOCK", "50", "STREAMS", "s", "$"]))
+            .expect("should be a blocking request");
+        assert_eq!(req.block, Some(50));
+        // A different command is ignored entirely.
+        assert!(as_blocking_xread(&cmd(&["GET", "k"])).is_none());
+    }
+
+    #[tokio::test]
+    async fn xread_block_returns_at_once_when_data_is_already_present() {
+        let srv = server();
+        process_command(cmd(&["XADD", "s", "1-0", "f", "v"]), &srv);
+        // The entry predates the read and the id bound is 0-0, so the blocking
+        // read should find it immediately without waiting out the timeout.
+        let req = parse_xread(&[
+            bulk("BLOCK"),
+            bulk("5000"),
+            bulk("STREAMS"),
+            bulk("s"),
+            bulk("0"),
+        ])
+        .unwrap();
+        let reply = xread_blocking(req, &srv).await;
+        let streams = match reply {
+            Value::Array(s) => s,
+            other => panic!("expected a stream array, got {:?}", other),
+        };
+        assert_eq!(streams.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn xread_block_times_out_to_nil_when_nothing_arrives() {
+        let srv = server();
+        // No writer, short timeout: the read parks and then gives up with nil.
+        let req = parse_xread(&[
+            bulk("BLOCK"),
+            bulk("20"),
+            bulk("STREAMS"),
+            bulk("s"),
+            bulk("$"),
+        ])
+        .unwrap();
+        assert_eq!(xread_blocking(req, &srv).await, Value::NullArray);
+    }
+
+    #[tokio::test]
+    async fn xread_block_wakes_when_an_entry_arrives() {
+        let srv = server();
+        // A second task appends after a short delay; the blocked reader should
+        // be woken by the XADD notification and return the new entry, well
+        // before its generous timeout.
+        let writer = srv.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            process_command(cmd(&["XADD", "s", "1-1", "f", "v"]), &writer);
+        });
+        let req = parse_xread(&[
+            bulk("BLOCK"),
+            bulk("5000"),
+            bulk("STREAMS"),
+            bulk("s"),
+            bulk("$"),
+        ])
+        .unwrap();
+        let reply = xread_blocking(req, &srv).await;
+        let streams = match reply {
+            Value::Array(s) => s,
+            other => panic!("expected a stream array, got {:?}", other),
+        };
+        assert_eq!(streams.len(), 1);
+        let pair = match &streams[0] {
+            Value::Array(p) => p,
+            other => panic!("expected [key, entries], got {:?}", other),
+        };
+        assert_eq!(pair[0], Value::BulkString("s".to_string()));
+        let entries = match &pair[1] {
+            Value::Array(e) => e,
+            other => panic!("expected entries array, got {:?}", other),
+        };
+        assert_eq!(entries.len(), 1);
     }
 
     #[test]
