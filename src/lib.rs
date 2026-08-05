@@ -1232,6 +1232,8 @@ pub fn process_command(value: Value, server: &Server) -> Value {
         "xadd" => xadd(&args, storage),
         "xlen" => xlen(&args, storage),
         "xrange" => xrange(&args, storage),
+        "xrevrange" => xrevrange(&args, storage),
+        "xdel" => xdel(&args, storage),
         "xread" => xread(&args, storage),
         "save" => save(&args, server),
         "bgsave" => bgsave(&args, server),
@@ -1317,6 +1319,7 @@ fn is_write_command(name: &str) -> bool {
             | "hset"
             | "hdel"
             | "xadd"
+            | "xdel"
     )
 }
 
@@ -2057,6 +2060,97 @@ fn xrange(args: &[Value], storage: &Store) -> Value {
     }
 }
 
+/// `XREVRANGE key end start [COUNT n]` — the same entries as `XRANGE` but in
+/// reverse (highest ID first). Note the bound order is flipped: `end` comes
+/// before `start`, matching Redis. Bounds accept `-`/`+`, a bare `<ms>`, a full
+/// `<ms>-<seq>`, or an exclusive `(<id>`. Replies with an array of
+/// `[id, [field, value, ...]]` entries newest-first, an empty array for a
+/// missing key, or an error on a bad bound/`COUNT`/wrong-typed key.
+fn xrevrange(args: &[Value], storage: &Store) -> Value {
+    if args.len() != 3 && args.len() != 5 {
+        return wrong_args("xrevrange");
+    }
+    let key = match unpack_bulk_str(&args[0]) {
+        Ok(k) => k,
+        Err(e) => return Value::Error(format!("ERR {}", e)),
+    };
+    // Argument order is `end start` — the reverse of XRANGE.
+    let end = match unpack_bulk_str(&args[1]).map_err(|e| format!("ERR {}", e)) {
+        Ok(s) => match stream::parse_range_end(&s) {
+            Ok(id) => id,
+            Err(e) => return Value::Error(e),
+        },
+        Err(e) => return Value::Error(e),
+    };
+    let start = match unpack_bulk_str(&args[2]).map_err(|e| format!("ERR {}", e)) {
+        Ok(s) => match stream::parse_range_start(&s) {
+            Ok(id) => id,
+            Err(e) => return Value::Error(e),
+        },
+        Err(e) => return Value::Error(e),
+    };
+    let count = match parse_optional_count(&args[3..]) {
+        Ok(c) => c,
+        Err(e) => return Value::Error(e),
+    };
+
+    let now = Instant::now();
+    let mut store = storage.lock().unwrap();
+    expire_if_due(&mut store, &key, now);
+    match store.get(&key) {
+        None => Value::Array(Vec::new()),
+        Some(e) => match &e.value {
+            StoredValue::Stream(s) => {
+                let entries = s.rev_range(start, end, count);
+                Value::Array(entries.into_iter().map(entry_to_value).collect())
+            }
+            _ => wrong_type(),
+        },
+    }
+}
+
+/// `XDEL key id [id ...]` — remove the named entries from the stream, replying
+/// with the count actually deleted (IDs that weren't present simply don't
+/// count). A missing key deletes nothing (`0`); a wrong-typed key is
+/// `WRONGTYPE`. The stream's `last_id` is left untouched even if every entry
+/// goes, so a future `XADD` can never reuse a deleted ID.
+fn xdel(args: &[Value], storage: &Store) -> Value {
+    if args.len() < 2 {
+        return wrong_args("xdel");
+    }
+    let key = match unpack_bulk_str(&args[0]) {
+        Ok(k) => k,
+        Err(e) => return Value::Error(format!("ERR {}", e)),
+    };
+    // Parse every ID up front so a malformed one rejects the whole command
+    // before we mutate anything.
+    let mut ids = Vec::with_capacity(args.len() - 1);
+    for arg in &args[1..] {
+        let s = match unpack_bulk_str(arg) {
+            Ok(s) => s,
+            Err(e) => return Value::Error(format!("ERR {}", e)),
+        };
+        match stream::parse_entry_id(&s) {
+            Ok(id) => ids.push(id),
+            Err(e) => return Value::Error(e),
+        }
+    }
+
+    let now = Instant::now();
+    let mut store = storage.lock().unwrap();
+    expire_if_due(&mut store, &key, now);
+    match store.get_mut(&key) {
+        None => Value::Integer(0),
+        Some(e) => match &mut e.value {
+            StoredValue::Stream(s) => {
+                let deleted = ids.iter().filter(|id| s.delete(**id)).count();
+                Value::Integer(deleted as i64)
+            }
+            _ => wrong_type(),
+        },
+    }
+}
+
 /// Parse an optional trailing `COUNT n` clause (the slice after the fixed
 /// arguments). An empty slice means no count; `COUNT n` yields `Some(n)`;
 /// anything else is a syntax error.
@@ -2408,13 +2502,29 @@ mod tests {
     fn write_commands_are_classified_for_replication() {
         for w in [
             "set", "del", "expire", "persist", "rpush", "lpush", "rpop", "lpop", "hset", "hdel",
-            "xadd",
+            "xadd", "xdel",
         ] {
             assert!(is_write_command(w), "{w} should replicate");
         }
         for r in [
-            "get", "ttl", "type", "llen", "lrange", "hget", "hgetall", "ping", "echo", "save",
-            "bgsave", "wait", "replconf", "psync", "xlen", "xrange", "xread",
+            "get",
+            "ttl",
+            "type",
+            "llen",
+            "lrange",
+            "hget",
+            "hgetall",
+            "ping",
+            "echo",
+            "save",
+            "bgsave",
+            "wait",
+            "replconf",
+            "psync",
+            "xlen",
+            "xrange",
+            "xrevrange",
+            "xread",
         ] {
             assert!(!is_write_command(r), "{r} should not replicate");
         }
@@ -2582,6 +2692,86 @@ mod tests {
             xrange(&[bulk("nope"), bulk("-"), bulk("+")], &st),
             Value::Array(vec![])
         );
+    }
+
+    #[test]
+    fn xrange_exclusive_bounds_drop_the_endpoints() {
+        let st = store();
+        for id in ["1-0", "2-0", "3-0"] {
+            xadd(&[bulk("s"), bulk(id), bulk("k"), bulk(id)], &st);
+        }
+        // `(1-0` .. `(3-0` excludes both ends, leaving only 2-0.
+        let reply = xrange(&[bulk("s"), bulk("(1-0"), bulk("(3-0")], &st);
+        let Value::Array(items) = reply else {
+            panic!("expected array");
+        };
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0],
+            Value::Array(vec![
+                Value::BulkString("2-0".to_string()),
+                Value::Array(vec![bulk("k"), bulk("2-0")]),
+            ])
+        );
+    }
+
+    #[test]
+    fn xrevrange_returns_entries_newest_first() {
+        let st = store();
+        for id in ["1-0", "2-0", "3-0"] {
+            xadd(&[bulk("s"), bulk(id), bulk("k"), bulk(id)], &st);
+        }
+        // Bounds are `end start` here: `+` down to `-`.
+        let reply = xrevrange(&[bulk("s"), bulk("+"), bulk("-")], &st);
+        let Value::Array(items) = reply else {
+            panic!("expected array");
+        };
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0], entry_to_value_id("3-0"));
+        assert_eq!(items[2], entry_to_value_id("1-0"));
+
+        // COUNT keeps the two highest IDs.
+        let reply = xrevrange(
+            &[bulk("s"), bulk("+"), bulk("-"), bulk("COUNT"), bulk("2")],
+            &st,
+        );
+        let Value::Array(items) = reply else {
+            panic!("expected array");
+        };
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0], entry_to_value_id("3-0"));
+        assert_eq!(items[1], entry_to_value_id("2-0"));
+    }
+
+    // Build the RESP shape `xadd(&["s", id, "k", id])` above stores for `id`.
+    fn entry_to_value_id(id: &str) -> Value {
+        Value::Array(vec![
+            Value::BulkString(id.to_string()),
+            Value::Array(vec![bulk("k"), bulk(id)]),
+        ])
+    }
+
+    #[test]
+    fn xdel_removes_named_entries_and_counts_them() {
+        let st = store();
+        for id in ["1-0", "2-0", "3-0"] {
+            xadd(&[bulk("s"), bulk(id), bulk("k"), bulk(id)], &st);
+        }
+        // Delete two present IDs plus one that isn't there: count is 2.
+        assert_eq!(
+            xdel(&[bulk("s"), bulk("1-0"), bulk("3-0"), bulk("9-9")], &st),
+            Value::Integer(2)
+        );
+        assert_eq!(xlen(&[bulk("s")], &st), Value::Integer(1));
+        // The high-water mark is preserved: re-adding 3-0 is still refused.
+        assert!(matches!(
+            xadd(&[bulk("s"), bulk("3-0"), bulk("f"), bulk("v")], &st),
+            Value::Error(_)
+        ));
+        // A missing key deletes nothing; a wrong-typed key is WRONGTYPE.
+        assert_eq!(xdel(&[bulk("nope"), bulk("1-0")], &st), Value::Integer(0));
+        set(&[bulk("str"), bulk("hi")], &st);
+        assert_eq!(xdel(&[bulk("str"), bulk("1-0")], &st), wrong_type());
     }
 
     #[test]
