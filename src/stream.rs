@@ -106,13 +106,48 @@ impl Stream {
             None => Vec::new(),
         }
     }
+
+    /// The entries in the inclusive range `[start, end]` but yielded **highest
+    /// ID first**, capped by `count`. This is what `XREVRANGE` returns: the same
+    /// window as [`range`], reversed, with the cap applied from the top so a
+    /// `COUNT n` keeps the `n` largest IDs rather than the `n` smallest.
+    pub fn rev_range(
+        &self,
+        start: StreamId,
+        end: StreamId,
+        count: Option<usize>,
+    ) -> Vec<&StreamEntry> {
+        // Collect the whole window ascending (no cap yet), then reverse and cap:
+        // capping before the reverse would keep the wrong end of the window.
+        let mut out = self.range(start, end, None);
+        out.reverse();
+        if let Some(c) = count {
+            out.truncate(c);
+        }
+        out
+    }
+
+    /// Remove the entry with exactly this ID, reporting whether one was there.
+    /// `entries` stays sorted, so a binary search (`partition_point`) finds the
+    /// slot in O(log n); a hit is removed with an O(n) shift. `last_id` is left
+    /// untouched on purpose — Redis never lowers a stream's high-water mark, so a
+    /// future ID can't collide with a just-deleted one even if the tail is gone.
+    pub fn delete(&mut self, id: StreamId) -> bool {
+        let idx = self.entries.partition_point(|e| e.id < id);
+        if idx < self.entries.len() && self.entries[idx].id == id {
+            self.entries.remove(idx);
+            true
+        } else {
+            false
+        }
+    }
 }
 
 impl StreamId {
     /// The next representable ID after `self`, or `None` if `self` is already
     /// the maximum. Incrementing the sequence is enough until it saturates, at
     /// which point the next ID rolls into the following millisecond at seq 0.
-    fn next(self) -> Option<StreamId> {
+    pub fn next(self) -> Option<StreamId> {
         if self.seq < u64::MAX {
             Some(StreamId {
                 ms: self.ms,
@@ -122,6 +157,27 @@ impl StreamId {
             Some(StreamId {
                 ms: self.ms + 1,
                 seq: 0,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// The previous representable ID before `self`, or `None` if `self` is
+    /// already `0-0`. The mirror of [`next`](StreamId::next): decrement the
+    /// sequence, and when it underflows drop into the previous millisecond at
+    /// the maximum sequence. Used to turn an *exclusive* end bound into the
+    /// inclusive one the range scan works with.
+    pub fn prev(self) -> Option<StreamId> {
+        if self.seq > 0 {
+            Some(StreamId {
+                ms: self.ms,
+                seq: self.seq - 1,
+            })
+        } else if self.ms > 0 {
+            Some(StreamId {
+                ms: self.ms - 1,
+                seq: u64::MAX,
             })
         } else {
             None
@@ -226,19 +282,43 @@ fn overflow_err() -> String {
     "ERR The stream has exhausted the last possible ID, unable to add more items".to_string()
 }
 
-/// Parse the *start* bound of an `XRANGE`/`XREAD`. `-` is the minimum ID; a
-/// bare `<ms>` means "the first entry in that millisecond", i.e. seq 0; a full
-/// `<ms>-<seq>` is taken exactly.
+/// Parse a fully specified entry ID as used by `XDEL`: a bare `<ms>` fills the
+/// sequence with `0`, a full `<ms>-<seq>` is taken exactly. Unlike the range
+/// parsers this rejects `-`/`+`/`(` — `XDEL` names concrete entries, not ranges.
+pub fn parse_entry_id(s: &str) -> Result<StreamId, String> {
+    parse_bound(s, 0)
+}
+
+/// Parse the *start* bound of an `XRANGE`/`XREVRANGE`/`XREAD`. `-` is the
+/// minimum ID; a bare `<ms>` means "the first entry in that millisecond", i.e.
+/// seq 0; a full `<ms>-<seq>` is taken exactly. A leading `(` makes the bound
+/// **exclusive**: the first ID strictly greater than the one written, which we
+/// express as the inclusive bound one step up (`id.next()`).
 pub fn parse_range_start(s: &str) -> Result<StreamId, String> {
+    if let Some(inner) = s.strip_prefix('(') {
+        let id = parse_bound(inner, 0)?;
+        // Exclusive lower bound one past the maximum ID means the window is
+        // empty; `MAX` as the inclusive start makes any real `end` invert it.
+        return Ok(id.next().unwrap_or(StreamId::MAX));
+    }
     if s == "-" {
         return Ok(StreamId::MIN);
     }
     parse_bound(s, 0)
 }
 
-/// Parse the *end* bound of an `XRANGE`. `+` is the maximum ID; a bare `<ms>`
-/// means "the last entry in that millisecond", i.e. the maximum sequence.
+/// Parse the *end* bound of an `XRANGE`/`XREVRANGE`. `+` is the maximum ID; a
+/// bare `<ms>` means "the last entry in that millisecond", i.e. the maximum
+/// sequence. A leading `(` makes the bound **exclusive**: the last ID strictly
+/// smaller than the one written, expressed as the inclusive bound one step down
+/// (`id.prev()`).
 pub fn parse_range_end(s: &str) -> Result<StreamId, String> {
+    if let Some(inner) = s.strip_prefix('(') {
+        let id = parse_bound(inner, u64::MAX)?;
+        // Exclusive upper bound below `0-0` means the window is empty; `MIN` as
+        // the inclusive end makes any real `start` invert it.
+        return Ok(id.prev().unwrap_or(StreamId::MIN));
+    }
     if s == "+" {
         return Ok(StreamId::MAX);
     }
@@ -386,5 +466,77 @@ mod tests {
         assert!(s
             .range(StreamId { ms: 3, seq: 0 }, StreamId { ms: 1, seq: 0 }, None)
             .is_empty());
+    }
+
+    #[test]
+    fn id_prev_is_the_inverse_of_next() {
+        let id = StreamId { ms: 5, seq: 3 };
+        assert_eq!(id.prev(), Some(StreamId { ms: 5, seq: 2 }));
+        // Sequence underflow borrows from the millisecond.
+        assert_eq!(
+            StreamId { ms: 5, seq: 0 }.prev(),
+            Some(StreamId {
+                ms: 4,
+                seq: u64::MAX
+            })
+        );
+        // Nothing precedes 0-0.
+        assert_eq!(StreamId::MIN.prev(), None);
+    }
+
+    #[test]
+    fn exclusive_bounds_nudge_one_step_inward() {
+        // `(5-5` as a start is the first ID strictly greater than 5-5.
+        assert_eq!(
+            parse_range_start("(5-5").unwrap(),
+            StreamId { ms: 5, seq: 6 }
+        );
+        // `(5-5` as an end is the last ID strictly smaller than 5-5.
+        assert_eq!(parse_range_end("(5-5").unwrap(), StreamId { ms: 5, seq: 4 });
+        // A bad inner ID is still rejected.
+        assert!(parse_range_start("(nope").is_err());
+    }
+
+    #[test]
+    fn rev_range_yields_highest_first_and_caps_from_the_top() {
+        let mut s = Stream::default();
+        s.append(StreamId { ms: 1, seq: 0 }, vec![("a".into(), "1".into())]);
+        s.append(StreamId { ms: 2, seq: 0 }, vec![("b".into(), "2".into())]);
+        s.append(StreamId { ms: 3, seq: 0 }, vec![("c".into(), "3".into())]);
+
+        let got = s.rev_range(StreamId::MIN, StreamId::MAX, None);
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0].id, StreamId { ms: 3, seq: 0 });
+        assert_eq!(got[2].id, StreamId { ms: 1, seq: 0 });
+
+        // COUNT keeps the two *highest* IDs, not the two lowest.
+        let got = s.rev_range(StreamId::MIN, StreamId::MAX, Some(2));
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].id, StreamId { ms: 3, seq: 0 });
+        assert_eq!(got[1].id, StreamId { ms: 2, seq: 0 });
+    }
+
+    #[test]
+    fn delete_removes_only_an_exact_match_and_keeps_last_id() {
+        let mut s = Stream::default();
+        s.append(StreamId { ms: 1, seq: 0 }, vec![("a".into(), "1".into())]);
+        s.append(StreamId { ms: 2, seq: 0 }, vec![("b".into(), "2".into())]);
+
+        assert!(!s.delete(StreamId { ms: 9, seq: 9 })); // no such entry
+        assert!(s.delete(StreamId { ms: 1, seq: 0 }));
+        assert_eq!(s.entries.len(), 1);
+        assert_eq!(s.entries[0].id, StreamId { ms: 2, seq: 0 });
+        // Deleting the tail does not lower the high-water mark.
+        assert!(s.delete(StreamId { ms: 2, seq: 0 }));
+        assert!(s.entries.is_empty());
+        assert_eq!(s.last_id, StreamId { ms: 2, seq: 0 });
+    }
+
+    #[test]
+    fn parse_entry_id_fills_seq_and_rejects_ranges() {
+        assert_eq!(parse_entry_id("5").unwrap(), StreamId { ms: 5, seq: 0 });
+        assert_eq!(parse_entry_id("5-2").unwrap(), StreamId { ms: 5, seq: 2 });
+        assert!(parse_entry_id("-").is_err());
+        assert!(parse_entry_id("+").is_err());
     }
 }
