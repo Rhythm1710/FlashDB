@@ -1269,3 +1269,88 @@ async fn xread_block_wakes_on_another_clients_write_over_tcp() {
         *1\r\n*2\r\n$3\r\n1-1\r\n*2\r\n$1\r\nk\r\n$1\r\nv\r\n";
     expect_reply(&mut reader, expected).await;
 }
+
+#[tokio::test]
+async fn xrevrange_returns_entries_newest_first_over_tcp() {
+    let addr = start_server().await;
+    let mut client = connect(addr).await;
+
+    for id in ["1-0", "2-0", "3-0"] {
+        let frame = format!(
+            "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n${}\r\n{}\r\n$1\r\nk\r\n$1\r\nv\r\n",
+            id.len(),
+            id
+        );
+        send(&mut client, frame.as_bytes()).await;
+        let reply = format!("${}\r\n{}\r\n", id.len(), id);
+        expect_reply(&mut client, &reply).await;
+    }
+
+    // XREVRANGE s + - -> all three entries, highest ID first.
+    send(
+        &mut client,
+        b"*4\r\n$9\r\nXREVRANGE\r\n$1\r\ns\r\n$1\r\n+\r\n$1\r\n-\r\n",
+    )
+    .await;
+    let expected = "*3\r\n\
+        *2\r\n$3\r\n3-0\r\n*2\r\n$1\r\nk\r\n$1\r\nv\r\n\
+        *2\r\n$3\r\n2-0\r\n*2\r\n$1\r\nk\r\n$1\r\nv\r\n\
+        *2\r\n$3\r\n1-0\r\n*2\r\n$1\r\nk\r\n$1\r\nv\r\n";
+    expect_reply(&mut client, expected).await;
+
+    // XRANGE with exclusive bounds `(1-0` `(3-0` keeps only the middle entry.
+    send(
+        &mut client,
+        b"*4\r\n$6\r\nXRANGE\r\n$1\r\ns\r\n$4\r\n(1-0\r\n$4\r\n(3-0\r\n",
+    )
+    .await;
+    let expected = "*1\r\n*2\r\n$3\r\n2-0\r\n*2\r\n$1\r\nk\r\n$1\r\nv\r\n";
+    expect_reply(&mut client, expected).await;
+}
+
+#[tokio::test]
+async fn xdel_removes_entries_and_reports_the_count_over_tcp() {
+    let addr = start_server().await;
+    let mut client = connect(addr).await;
+
+    for id in ["1-0", "2-0", "3-0"] {
+        let frame = format!(
+            "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n${}\r\n{}\r\n$1\r\nk\r\n$1\r\nv\r\n",
+            id.len(),
+            id
+        );
+        send(&mut client, frame.as_bytes()).await;
+        let reply = format!("${}\r\n{}\r\n", id.len(), id);
+        expect_reply(&mut client, &reply).await;
+    }
+
+    // XDEL s 1-0 3-0 9-9 -> deletes the two present IDs, ignores the absent one.
+    send(
+        &mut client,
+        b"*5\r\n$4\r\nXDEL\r\n$1\r\ns\r\n$3\r\n1-0\r\n$3\r\n3-0\r\n$3\r\n9-9\r\n",
+    )
+    .await;
+    expect_reply(&mut client, ":2\r\n").await;
+
+    // Only 2-0 survives.
+    send(
+        &mut client,
+        b"*4\r\n$6\r\nXRANGE\r\n$1\r\ns\r\n$1\r\n-\r\n$1\r\n+\r\n",
+    )
+    .await;
+    let expected = "*1\r\n*2\r\n$3\r\n2-0\r\n*2\r\n$1\r\nk\r\n$1\r\nv\r\n";
+    expect_reply(&mut client, expected).await;
+
+    // The high-water mark stayed at 3-0: re-adding it is refused.
+    send(
+        &mut client,
+        b"*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n3-0\r\n$1\r\nk\r\n$1\r\nv\r\n",
+    )
+    .await;
+    let mut buf = [0u8; 256];
+    let n = client.read(&mut buf).await.unwrap();
+    assert!(
+        buf[..n].starts_with(b"-ERR"),
+        "re-adding a deleted top ID should be refused"
+    );
+}

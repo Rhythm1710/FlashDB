@@ -81,6 +81,8 @@ starting.
 - `XADD key <id> field value [field value ...]`
 - `XLEN key`
 - `XRANGE key start end [COUNT count]`
+- `XREVRANGE key end start [COUNT count]`
+- `XDEL key id [id ...]`
 - `XREAD [COUNT count] [BLOCK ms] STREAMS key [key ...] id [id ...]`
 
 ## Transactions
@@ -159,7 +161,18 @@ returns the entries whose IDs fall in the inclusive range `[start, end]`; the
 bounds accept `-` and `+` (the smallest and largest possible IDs), a bare
 `<ms>` (which covers the whole millisecond), or a full `<ms>-<seq>`, and
 `COUNT` caps how many entries come back. Each entry is returned as
-`[id, [field, value, ...]]`.
+`[id, [field, value, ...]]`. A bound may be made **exclusive** by prefixing it
+with `(` — for example `XRANGE key (1-0 (3-0` returns everything strictly
+between `1-0` and `3-0`, dropping both endpoints.
+
+`XREVRANGE key end start [COUNT count]` returns the same window as `XRANGE` but
+in reverse, highest ID first. Note the bound order is flipped — `end` is given
+before `start` — matching Redis; `COUNT` keeps the highest IDs.
+
+`XDEL key id [id ...]` removes the named entries and returns the number actually
+deleted (IDs that weren't present don't count). Deleting entries never lowers the
+stream's high-water mark, so a future `XADD` can't reuse the ID of a deleted
+entry even if the whole stream is emptied.
 
 `XREAD [COUNT count] [BLOCK ms] STREAMS key [key ...] id [id ...]` reads entries
 newer than a given ID from one or more streams at once: it returns, for each
