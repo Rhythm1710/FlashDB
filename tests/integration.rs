@@ -1354,3 +1354,61 @@ async fn xdel_removes_entries_and_reports_the_count_over_tcp() {
         "re-adding a deleted top ID should be refused"
     );
 }
+
+#[tokio::test]
+async fn xtrim_drops_the_oldest_entries_over_tcp() {
+    let addr = start_server().await;
+    let mut client = connect(addr).await;
+
+    for id in ["1-0", "2-0", "3-0", "4-0"] {
+        let frame = format!(
+            "*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n${}\r\n{}\r\n$1\r\nk\r\n$1\r\nv\r\n",
+            id.len(),
+            id
+        );
+        send(&mut client, frame.as_bytes()).await;
+        let reply = format!("${}\r\n{}\r\n", id.len(), id);
+        expect_reply(&mut client, &reply).await;
+    }
+
+    // XTRIM s MAXLEN 2 -> drops the two oldest entries, reports the count.
+    send(
+        &mut client,
+        b"*4\r\n$5\r\nXTRIM\r\n$1\r\ns\r\n$6\r\nMAXLEN\r\n$1\r\n2\r\n",
+    )
+    .await;
+    expect_reply(&mut client, ":2\r\n").await;
+
+    // Only the two newest entries survive.
+    send(
+        &mut client,
+        b"*4\r\n$6\r\nXRANGE\r\n$1\r\ns\r\n$1\r\n-\r\n$1\r\n+\r\n",
+    )
+    .await;
+    let expected = "*2\r\n\
+        *2\r\n$3\r\n3-0\r\n*2\r\n$1\r\nk\r\n$1\r\nv\r\n\
+        *2\r\n$3\r\n4-0\r\n*2\r\n$1\r\nk\r\n$1\r\nv\r\n";
+    expect_reply(&mut client, expected).await;
+
+    // The high-water mark stayed at 4-0: re-adding it is refused even though
+    // the entry itself was trimmed away.
+    send(
+        &mut client,
+        b"*5\r\n$4\r\nXADD\r\n$1\r\ns\r\n$3\r\n4-0\r\n$1\r\nk\r\n$1\r\nv\r\n",
+    )
+    .await;
+    let mut buf = [0u8; 256];
+    let n = client.read(&mut buf).await.unwrap();
+    assert!(
+        buf[..n].starts_with(b"-ERR"),
+        "re-adding a trimmed top ID should be refused"
+    );
+
+    // A threshold at or above the current length trims nothing.
+    send(
+        &mut client,
+        b"*4\r\n$5\r\nXTRIM\r\n$1\r\ns\r\n$6\r\nMAXLEN\r\n$2\r\n10\r\n",
+    )
+    .await;
+    expect_reply(&mut client, ":0\r\n").await;
+}

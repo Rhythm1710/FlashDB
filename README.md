@@ -83,6 +83,7 @@ starting.
 - `XRANGE key start end [COUNT count]`
 - `XREVRANGE key end start [COUNT count]`
 - `XDEL key id [id ...]`
+- `XTRIM key MAXLEN [=|~] threshold`
 - `XREAD [COUNT count] [BLOCK ms] STREAMS key [key ...] id [id ...]`
 
 ## Transactions
@@ -173,6 +174,12 @@ before `start` — matching Redis; `COUNT` keeps the highest IDs.
 deleted (IDs that weren't present don't count). Deleting entries never lowers the
 stream's high-water mark, so a future `XADD` can't reuse the ID of a deleted
 entry even if the whole stream is emptied.
+
+`XTRIM key MAXLEN [=|~] threshold` drops the oldest entries until at most
+`threshold` remain, returning the number actually removed. The optional `=`/`~`
+exactness marker Redis accepts before the threshold is parsed but doesn't change
+FlashDB's behavior — trimming is always exact. Like `XDEL`, trimming never
+lowers the stream's high-water mark.
 
 `XREAD [COUNT count] [BLOCK ms] STREAMS key [key ...] id [id ...]` reads entries
 newer than a given ID from one or more streams at once: it returns, for each
