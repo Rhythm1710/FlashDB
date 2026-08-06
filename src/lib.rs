@@ -1234,6 +1234,7 @@ pub fn process_command(value: Value, server: &Server) -> Value {
         "xrange" => xrange(&args, storage),
         "xrevrange" => xrevrange(&args, storage),
         "xdel" => xdel(&args, storage),
+        "xtrim" => xtrim(&args, storage),
         "xread" => xread(&args, storage),
         "save" => save(&args, server),
         "bgsave" => bgsave(&args, server),
@@ -1320,6 +1321,7 @@ fn is_write_command(name: &str) -> bool {
             | "hdel"
             | "xadd"
             | "xdel"
+            | "xtrim"
     )
 }
 
@@ -2151,6 +2153,64 @@ fn xdel(args: &[Value], storage: &Store) -> Value {
     }
 }
 
+/// `XTRIM key MAXLEN [=|~] threshold` — drop the oldest entries until at most
+/// `threshold` remain, replying with the number actually removed. The `=`/`~`
+/// exactness marker Redis accepts before the threshold is parsed but not acted
+/// on differently — like the RDB writer's plain-string encoding, approximate
+/// trimming is a size/performance tweak, not a correctness difference, so
+/// FlashDB always trims exactly. A missing key trims nothing (`0`); a
+/// wrong-typed key is `WRONGTYPE`. Like `XDEL`, trimming never lowers the
+/// stream's high-water mark, so a future `XADD` still can't reuse a
+/// just-trimmed ID.
+fn xtrim(args: &[Value], storage: &Store) -> Value {
+    if args.len() != 3 && args.len() != 4 {
+        return wrong_args("xtrim");
+    }
+    let key = match unpack_bulk_str(&args[0]) {
+        Ok(k) => k,
+        Err(e) => return Value::Error(format!("ERR {}", e)),
+    };
+    let strategy = match unpack_bulk_str(&args[1]) {
+        Ok(s) => s,
+        Err(e) => return Value::Error(format!("ERR {}", e)),
+    };
+    if !strategy.eq_ignore_ascii_case("maxlen") {
+        return Value::Error("ERR syntax error".to_string());
+    }
+    let threshold_arg = if args.len() == 4 {
+        let modifier = match unpack_bulk_str(&args[2]) {
+            Ok(m) => m,
+            Err(e) => return Value::Error(format!("ERR {}", e)),
+        };
+        if modifier != "=" && modifier != "~" {
+            return Value::Error("ERR syntax error".to_string());
+        }
+        &args[3]
+    } else {
+        &args[2]
+    };
+    let threshold = match unpack_bulk_str(threshold_arg) {
+        Ok(s) => match s.parse::<usize>() {
+            Ok(n) => n,
+            Err(_) => {
+                return Value::Error("ERR value is not an integer or out of range".to_string())
+            }
+        },
+        Err(e) => return Value::Error(format!("ERR {}", e)),
+    };
+
+    let now = Instant::now();
+    let mut store = storage.lock().unwrap();
+    expire_if_due(&mut store, &key, now);
+    match store.get_mut(&key) {
+        None => Value::Integer(0),
+        Some(e) => match &mut e.value {
+            StoredValue::Stream(s) => Value::Integer(s.trim(threshold) as i64),
+            _ => wrong_type(),
+        },
+    }
+}
+
 /// Parse an optional trailing `COUNT n` clause (the slice after the fixed
 /// arguments). An empty slice means no count; `COUNT n` yields `Some(n)`;
 /// anything else is a syntax error.
@@ -2502,7 +2562,7 @@ mod tests {
     fn write_commands_are_classified_for_replication() {
         for w in [
             "set", "del", "expire", "persist", "rpush", "lpush", "rpop", "lpop", "hset", "hdel",
-            "xadd", "xdel",
+            "xadd", "xdel", "xtrim",
         ] {
             assert!(is_write_command(w), "{w} should replicate");
         }
@@ -2772,6 +2832,75 @@ mod tests {
         assert_eq!(xdel(&[bulk("nope"), bulk("1-0")], &st), Value::Integer(0));
         set(&[bulk("str"), bulk("hi")], &st);
         assert_eq!(xdel(&[bulk("str"), bulk("1-0")], &st), wrong_type());
+    }
+
+    #[test]
+    fn xtrim_drops_the_oldest_entries_and_reports_the_count() {
+        let st = store();
+        for id in ["1-0", "2-0", "3-0", "4-0"] {
+            xadd(&[bulk("s"), bulk(id), bulk("k"), bulk(id)], &st);
+        }
+        // MAXLEN 2 drops the two oldest entries.
+        assert_eq!(
+            xtrim(&[bulk("s"), bulk("MAXLEN"), bulk("2")], &st),
+            Value::Integer(2)
+        );
+        assert_eq!(xlen(&[bulk("s")], &st), Value::Integer(2));
+        let reply = xrange(&[bulk("s"), bulk("-"), bulk("+")], &st);
+        assert_eq!(
+            reply,
+            Value::Array(vec![
+                Value::Array(vec![
+                    Value::BulkString("3-0".into()),
+                    Value::Array(vec![
+                        Value::BulkString("k".into()),
+                        Value::BulkString("3-0".into())
+                    ]),
+                ]),
+                Value::Array(vec![
+                    Value::BulkString("4-0".into()),
+                    Value::Array(vec![
+                        Value::BulkString("k".into()),
+                        Value::BulkString("4-0".into())
+                    ]),
+                ]),
+            ])
+        );
+
+        // The optional `=` exactness marker is accepted; a threshold at or above
+        // the current length trims nothing.
+        assert_eq!(
+            xtrim(&[bulk("s"), bulk("MAXLEN"), bulk("="), bulk("10")], &st),
+            Value::Integer(0)
+        );
+
+        // The high-water mark stayed at 4-0: re-adding it is refused even though
+        // the entry itself is long gone.
+        assert!(matches!(
+            xadd(&[bulk("s"), bulk("4-0"), bulk("f"), bulk("v")], &st),
+            Value::Error(_)
+        ));
+
+        // Unknown strategy / bad modifier are syntax errors.
+        assert_eq!(
+            xtrim(&[bulk("s"), bulk("MINLEN"), bulk("2")], &st),
+            Value::Error("ERR syntax error".to_string())
+        );
+        assert_eq!(
+            xtrim(&[bulk("s"), bulk("MAXLEN"), bulk("?"), bulk("2")], &st),
+            Value::Error("ERR syntax error".to_string())
+        );
+
+        // A missing key trims nothing; a wrong-typed key is WRONGTYPE.
+        assert_eq!(
+            xtrim(&[bulk("nope"), bulk("MAXLEN"), bulk("5")], &st),
+            Value::Integer(0)
+        );
+        set(&[bulk("str"), bulk("hi")], &st);
+        assert_eq!(
+            xtrim(&[bulk("str"), bulk("MAXLEN"), bulk("5")], &st),
+            wrong_type()
+        );
     }
 
     #[test]
