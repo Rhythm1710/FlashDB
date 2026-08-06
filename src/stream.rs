@@ -127,6 +127,21 @@ impl Stream {
         out
     }
 
+    /// Drop the oldest entries until at most `maxlen` remain, reporting how many
+    /// were removed. This is `XTRIM key MAXLEN <maxlen>`'s primitive: `entries`
+    /// is always sorted oldest-first, so the entries to discard are exactly the
+    /// leading slice `..excess`, and `Vec::drain` removes that whole run in one
+    /// bulk shift rather than popping one at a time. Like [`delete`](Stream::delete),
+    /// `last_id` is left untouched — trimming away every entry still doesn't let
+    /// a future `XADD` reuse an old ID.
+    pub fn trim(&mut self, maxlen: usize) -> usize {
+        let excess = self.entries.len().saturating_sub(maxlen);
+        if excess > 0 {
+            self.entries.drain(..excess);
+        }
+        excess
+    }
+
     /// Remove the entry with exactly this ID, reporting whether one was there.
     /// `entries` stays sorted, so a binary search (`partition_point`) finds the
     /// slot in O(log n); a hit is removed with an O(n) shift. `last_id` is left
@@ -514,6 +529,34 @@ mod tests {
         assert_eq!(got.len(), 2);
         assert_eq!(got[0].id, StreamId { ms: 3, seq: 0 });
         assert_eq!(got[1].id, StreamId { ms: 2, seq: 0 });
+    }
+
+    #[test]
+    fn trim_drops_the_oldest_entries_and_keeps_last_id() {
+        let mut s = Stream::default();
+        for i in 1..=5u64 {
+            s.append(
+                StreamId { ms: i, seq: 0 },
+                vec![("k".into(), i.to_string())],
+            );
+        }
+
+        // Trimming to 3 drops the two oldest (1-0, 2-0) and reports the count.
+        assert_eq!(s.trim(3), 2);
+        assert_eq!(s.entries.len(), 3);
+        assert_eq!(s.entries[0].id, StreamId { ms: 3, seq: 0 });
+        assert_eq!(s.entries[2].id, StreamId { ms: 5, seq: 0 });
+        // The high-water mark never moves, even though the tail is untouched here.
+        assert_eq!(s.last_id, StreamId { ms: 5, seq: 0 });
+
+        // A maxlen at or above the current length removes nothing.
+        assert_eq!(s.trim(10), 0);
+        assert_eq!(s.entries.len(), 3);
+
+        // Trimming to 0 empties the stream but still leaves last_id alone.
+        assert_eq!(s.trim(0), 3);
+        assert!(s.entries.is_empty());
+        assert_eq!(s.last_id, StreamId { ms: 5, seq: 0 });
     }
 
     #[test]
