@@ -1412,3 +1412,37 @@ async fn xtrim_drops_the_oldest_entries_over_tcp() {
     .await;
     expect_reply(&mut client, ":0\r\n").await;
 }
+
+#[tokio::test]
+async fn xadd_with_maxlen_trims_after_each_add_over_tcp() {
+    let addr = start_server().await;
+    let mut client = connect(addr).await;
+
+    // Each XADD carries its own `MAXLEN 2` clause, so the stream never grows
+    // past two entries even though three are added.
+    for id in ["1-0", "2-0", "3-0"] {
+        let frame = format!(
+            "*7\r\n$4\r\nXADD\r\n$1\r\ns\r\n$6\r\nMAXLEN\r\n$1\r\n2\r\n${}\r\n{}\r\n$1\r\nk\r\n$1\r\nv\r\n",
+            id.len(),
+            id
+        );
+        send(&mut client, frame.as_bytes()).await;
+        let reply = format!("${}\r\n{}\r\n", id.len(), id);
+        expect_reply(&mut client, &reply).await;
+    }
+
+    // The newest entry (3-0, just added) survives alongside 2-0 — proving
+    // the trim ran *after* the append, not before it.
+    send(&mut client, b"*2\r\n$4\r\nXLEN\r\n$1\r\ns\r\n").await;
+    expect_reply(&mut client, ":2\r\n").await;
+
+    send(
+        &mut client,
+        b"*4\r\n$6\r\nXRANGE\r\n$1\r\ns\r\n$1\r\n-\r\n$1\r\n+\r\n",
+    )
+    .await;
+    let expected = "*2\r\n\
+        *2\r\n$3\r\n2-0\r\n*2\r\n$1\r\nk\r\n$1\r\nv\r\n\
+        *2\r\n$3\r\n3-0\r\n*2\r\n$1\r\nk\r\n$1\r\nv\r\n";
+    expect_reply(&mut client, expected).await;
+}

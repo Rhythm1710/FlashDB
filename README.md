@@ -78,7 +78,7 @@ starting.
 - `SUBSCRIBE channel [channel ...]`
 - `UNSUBSCRIBE [channel ...]`
 - `PUBLISH channel message`
-- `XADD key <id> field value [field value ...]`
+- `XADD key [MAXLEN [=|~] threshold] <id> field value [field value ...]`
 - `XLEN key`
 - `XRANGE key start end [COUNT count]`
 - `XREVRANGE key end start [COUNT count]`
@@ -144,8 +144,8 @@ A **stream** is an append-only log of entries. Each entry has a unique,
 monotonically increasing ID of the form `<ms>-<seq>` (a millisecond timestamp
 and a per-millisecond sequence counter) and a set of field/value pairs.
 
-`XADD key <id> field value [field value ...]` appends an entry and returns the
-ID it was stored under. The `<id>` may be:
+`XADD key [MAXLEN [=|~] threshold] <id> field value [field value ...]` appends
+an entry and returns the ID it was stored under. The `<id>` may be:
 
 - `*` — both parts auto-generated (the millisecond comes from the clock, or the
   last entry's millisecond if the clock hasn't advanced, and the sequence is the
@@ -156,6 +156,12 @@ ID it was stored under. The `<id>` may be:
 
 The resolved ID must be strictly greater than the stream's current top ID (and
 greater than `0-0`), otherwise `XADD` errors and the stream is left untouched.
+
+An optional leading `MAXLEN [=|~] threshold` clause trims the stream down to
+`threshold` entries — using the same trim primitive as the standalone `XTRIM`
+below — *after* the new entry is appended, so the just-added entry is never
+the one trimmed away. As with `XTRIM`, the `=`/`~` exactness marker is parsed
+but doesn't change FlashDB's behavior.
 
 `XLEN key` returns the number of entries. `XRANGE key start end [COUNT count]`
 returns the entries whose IDs fall in the inclusive range `[start, end]`; the
