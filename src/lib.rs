@@ -1902,26 +1902,40 @@ fn hdel(args: &[Value], storage: &Store) -> Value {
     Value::Integer(removed)
 }
 
-/// `XADD key <id> field value [field value ...]` — append an entry to a stream,
-/// creating the stream if the key is absent. `<id>` is `*` (fully auto),
-/// `<ms>-*` / `<ms>` (auto sequence), or an explicit `<ms>-<seq>`; the resolved
-/// ID must be strictly greater than the stream's current top ID. Replies with
-/// the ID actually stored (a bulk string), or an error on a wrong-typed key, a
-/// bad ID, or an ID that isn't large enough.
+/// `XADD key [MAXLEN [=|~] threshold] <id> field value [field value ...]` —
+/// append an entry to a stream, creating the stream if the key is absent.
+/// `<id>` is `*` (fully auto), `<ms>-*` / `<ms>` (auto sequence), or an
+/// explicit `<ms>-<seq>`; the resolved ID must be strictly greater than the
+/// stream's current top ID. If `MAXLEN` is given, the stream is trimmed down
+/// to `threshold` entries (via the same [`stream::Stream::trim`] primitive
+/// `XTRIM` uses) *after* the new entry is appended, so `MAXLEN 0` still keeps
+/// the entry just added out of the deletion — trim runs after, not before.
+/// Replies with the ID actually stored (a bulk string), or an error on a
+/// wrong-typed key, a bad ID, an ID that isn't large enough, or a malformed
+/// `MAXLEN` clause.
 fn xadd(args: &[Value], storage: &Store) -> Value {
     // key + id + at least one field/value pair.
     if args.len() < 4 {
-        return wrong_args("xadd");
-    }
-    let field_value_args = &args[2..];
-    if !field_value_args.len().is_multiple_of(2) {
         return wrong_args("xadd");
     }
     let key = match unpack_bulk_str(&args[0]) {
         Ok(k) => k,
         Err(e) => return Value::Error(format!("ERR {}", e)),
     };
-    let id_arg = match unpack_bulk_str(&args[1]) {
+    let (maxlen, consumed) = match parse_maxlen_clause(&args[1..]) {
+        Ok(Some((threshold, consumed))) => (Some(threshold), consumed),
+        Ok(None) => (None, 0),
+        Err(e) => return Value::Error(e),
+    };
+    let rest = &args[1 + consumed..];
+    if rest.len() < 3 {
+        return wrong_args("xadd");
+    }
+    let field_value_args = &rest[1..];
+    if !field_value_args.len().is_multiple_of(2) {
+        return wrong_args("xadd");
+    }
+    let id_arg = match unpack_bulk_str(&rest[0]) {
         Ok(s) => s,
         Err(e) => return Value::Error(format!("ERR {}", e)),
     };
@@ -1971,6 +1985,9 @@ fn xadd(args: &[Value], storage: &Store) -> Value {
     match &mut entry.value {
         StoredValue::Stream(s) => {
             s.append(id, fields);
+            if let Some(threshold) = maxlen {
+                s.trim(threshold);
+            }
             Value::BulkString(id.to_string())
         }
         // The pre-check above already returned WRONGTYPE for a non-stream key,
@@ -2731,6 +2748,89 @@ mod tests {
             get(&[bulk("str")], &st),
             Value::BulkString("hi".to_string())
         );
+    }
+
+    #[test]
+    fn xadd_with_maxlen_trims_after_appending() {
+        let st = store();
+        for id in ["1-0", "2-0", "3-0"] {
+            xadd(
+                &[
+                    bulk("s"),
+                    bulk("MAXLEN"),
+                    bulk("2"),
+                    bulk(id),
+                    bulk("k"),
+                    bulk(id),
+                ],
+                &st,
+            );
+        }
+        // Each add is followed by a trim to 2, so only the newest two survive
+        // — including the entry that was *just* added, proving trim runs
+        // after the append rather than before.
+        assert_eq!(xlen(&[bulk("s")], &st), Value::Integer(2));
+        let reply = xrange(&[bulk("s"), bulk("-"), bulk("+")], &st);
+        assert_eq!(
+            reply,
+            Value::Array(vec![
+                Value::Array(vec![
+                    Value::BulkString("2-0".into()),
+                    Value::Array(vec![
+                        Value::BulkString("k".into()),
+                        Value::BulkString("2-0".into())
+                    ]),
+                ]),
+                Value::Array(vec![
+                    Value::BulkString("3-0".into()),
+                    Value::Array(vec![
+                        Value::BulkString("k".into()),
+                        Value::BulkString("3-0".into())
+                    ]),
+                ]),
+            ])
+        );
+
+        // The `=` exactness marker is accepted, same as XTRIM.
+        assert_eq!(
+            xadd(
+                &[
+                    bulk("s"),
+                    bulk("MAXLEN"),
+                    bulk("="),
+                    bulk("1"),
+                    bulk("4-0"),
+                    bulk("k"),
+                    bulk("4-0")
+                ],
+                &st
+            ),
+            Value::BulkString("4-0".to_string())
+        );
+        assert_eq!(xlen(&[bulk("s")], &st), Value::Integer(1));
+
+        // Without MAXLEN, XADD behaves exactly as before — no trimming.
+        for id in ["5-0", "6-0"] {
+            xadd(&[bulk("s"), bulk(id), bulk("k"), bulk(id)], &st);
+        }
+        assert_eq!(xlen(&[bulk("s")], &st), Value::Integer(3));
+
+        // A malformed MAXLEN clause is a syntax/parse error and never
+        // creates the key.
+        assert_eq!(
+            xadd(
+                &[
+                    bulk("nope"),
+                    bulk("MAXLEN"),
+                    bulk("*"),
+                    bulk("f"),
+                    bulk("v")
+                ],
+                &st
+            ),
+            Value::Error("ERR value is not an integer or out of range".to_string())
+        );
+        assert_eq!(xlen(&[bulk("nope")], &st), Value::Integer(0));
     }
 
     #[test]
