@@ -2163,40 +2163,17 @@ fn xdel(args: &[Value], storage: &Store) -> Value {
 /// stream's high-water mark, so a future `XADD` still can't reuse a
 /// just-trimmed ID.
 fn xtrim(args: &[Value], storage: &Store) -> Value {
-    if args.len() != 3 && args.len() != 4 {
+    if args.len() < 2 {
         return wrong_args("xtrim");
     }
     let key = match unpack_bulk_str(&args[0]) {
         Ok(k) => k,
         Err(e) => return Value::Error(format!("ERR {}", e)),
     };
-    let strategy = match unpack_bulk_str(&args[1]) {
-        Ok(s) => s,
-        Err(e) => return Value::Error(format!("ERR {}", e)),
-    };
-    if !strategy.eq_ignore_ascii_case("maxlen") {
-        return Value::Error("ERR syntax error".to_string());
-    }
-    let threshold_arg = if args.len() == 4 {
-        let modifier = match unpack_bulk_str(&args[2]) {
-            Ok(m) => m,
-            Err(e) => return Value::Error(format!("ERR {}", e)),
-        };
-        if modifier != "=" && modifier != "~" {
-            return Value::Error("ERR syntax error".to_string());
-        }
-        &args[3]
-    } else {
-        &args[2]
-    };
-    let threshold = match unpack_bulk_str(threshold_arg) {
-        Ok(s) => match s.parse::<usize>() {
-            Ok(n) => n,
-            Err(_) => {
-                return Value::Error("ERR value is not an integer or out of range".to_string())
-            }
-        },
-        Err(e) => return Value::Error(format!("ERR {}", e)),
+    let threshold = match parse_maxlen_clause(&args[1..]) {
+        Ok(Some((threshold, consumed))) if consumed == args.len() - 1 => threshold,
+        Ok(_) => return Value::Error("ERR syntax error".to_string()),
+        Err(e) => return Value::Error(e),
     };
 
     let now = Instant::now();
@@ -2209,6 +2186,42 @@ fn xtrim(args: &[Value], storage: &Store) -> Value {
             _ => wrong_type(),
         },
     }
+}
+
+/// Try to parse a `MAXLEN [=|~] threshold` clause from the front of `args`.
+/// `Ok(None)` means `args` is empty or doesn't start with the `MAXLEN`
+/// keyword — "no clause here", not an error, so callers like `XADD` can treat
+/// it as "trim not requested" and keep parsing whatever comes next (the
+/// entry ID). `Ok(Some((threshold, consumed)))` gives the parsed threshold
+/// and how many argument slots the clause ate — 2 without the optional
+/// `=`/`~` exactness marker, 3 with it — so a caller with more arguments
+/// after the clause (like `XADD`'s id/field/value tail) knows where its own
+/// parsing resumes. `Err` only fires once we're committed to `MAXLEN` having
+/// started: a missing threshold or one that doesn't parse as a `usize`.
+/// Shared by `XADD`'s optional trim-on-add clause and `XTRIM`'s dedicated
+/// command so the exactness marker and error messages can't drift apart.
+fn parse_maxlen_clause(args: &[Value]) -> Result<Option<(usize, usize)>, String> {
+    let Some(first) = args.first() else {
+        return Ok(None);
+    };
+    let keyword = unpack_bulk_str(first).map_err(|e| format!("ERR {}", e))?;
+    if !keyword.eq_ignore_ascii_case("maxlen") {
+        return Ok(None);
+    }
+    let mut idx = 1;
+    let modifier = args.get(idx).and_then(|v| unpack_bulk_str(v).ok());
+    if matches!(modifier.as_deref(), Some("=") | Some("~")) {
+        idx += 1;
+    }
+    let threshold_arg = match args.get(idx) {
+        Some(v) => v,
+        None => return Err("ERR syntax error".to_string()),
+    };
+    let threshold = unpack_bulk_str(threshold_arg)
+        .map_err(|e| format!("ERR {}", e))?
+        .parse::<usize>()
+        .map_err(|_| "ERR value is not an integer or out of range".to_string())?;
+    Ok(Some((threshold, idx + 1)))
 }
 
 /// Parse an optional trailing `COUNT n` clause (the slice after the fixed
@@ -2881,13 +2894,20 @@ mod tests {
             Value::Error(_)
         ));
 
-        // Unknown strategy / bad modifier are syntax errors.
+        // An unknown strategy is a syntax error. A bad modifier isn't treated
+        // as `=`/`~` at all — it's read as the threshold itself, so it fails
+        // to parse as a number instead.
         assert_eq!(
             xtrim(&[bulk("s"), bulk("MINLEN"), bulk("2")], &st),
             Value::Error("ERR syntax error".to_string())
         );
         assert_eq!(
             xtrim(&[bulk("s"), bulk("MAXLEN"), bulk("?"), bulk("2")], &st),
+            Value::Error("ERR value is not an integer or out of range".to_string())
+        );
+        // Trailing garbage after a valid clause is still a syntax error.
+        assert_eq!(
+            xtrim(&[bulk("s"), bulk("MAXLEN"), bulk("2"), bulk("extra")], &st),
             Value::Error("ERR syntax error".to_string())
         );
 
