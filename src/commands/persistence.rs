@@ -157,7 +157,9 @@ fn connected_replica_count(replicas: &Replicas) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{hset, load_store_from_rdb, push, set, Config, Side};
+    use crate::commands::hashes::hset;
+    use crate::commands::lists::{push, Side};
+    use crate::{load_store_from_rdb, set, Config};
     use bytes::Bytes;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;

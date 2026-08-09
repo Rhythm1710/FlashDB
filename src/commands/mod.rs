@@ -6,9 +6,13 @@
 //! and the RDB/replication/pub-sub plumbing all in one file. `persistence` is
 //! the first slice out: `SAVE`, `BGSAVE`, `WAIT`, and the snapshot helpers
 //! they share, which only ever talk to a [`crate::Server`] and the `rdb`
-//! module — nothing about them depends on any other command group. Future
-//! sessions can keep peeling groups out the same way (strings/lists/hashes,
-//! streams, pub/sub, transactions) until `lib.rs` is just wiring: the
-//! connection loop and the `process_command` dispatch table.
+//! module — nothing about them depends on any other command group. `lists`
+//! and `hashes` follow the same pattern for `RPUSH`/`LPUSH`/`RPOP`/`LPOP`/
+//! `LLEN`/`LRANGE` and `HSET`/`HGET`/`HGETALL`/`HDEL`. Future sessions can
+//! keep peeling groups out the same way (streams, pub/sub, transactions)
+//! until `lib.rs` is just wiring: the connection loop and the
+//! `process_command` dispatch table.
 
+pub(crate) mod hashes;
+pub(crate) mod lists;
 pub(crate) mod persistence;
