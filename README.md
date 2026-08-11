@@ -352,8 +352,12 @@ being split into `src/commands/`, one module per self-contained command group.
 `src/commands/persistence.rs` (`SAVE`/`BGSAVE`/`WAIT` and the RDB snapshot
 helpers) was the first slice out; `src/commands/lists.rs`
 (`RPUSH`/`LPUSH`/`RPOP`/`LPOP`/`LLEN`/`LRANGE`) and `src/commands/hashes.rs`
-(`HSET`/`HGET`/`HGETALL`/`HDEL`) followed. More groups move the same way as
-they're touched next — the stream commands are the biggest remaining chunk.
+(`HSET`/`HGET`/`HGETALL`/`HDEL`) followed, then `src/commands/streams.rs` —
+the biggest group yet — took `XADD`/`XLEN`/`XRANGE`/`XREVRANGE`/`XDEL`/`XTRIM`/
+`XREAD` plus the async blocking `XREAD ... BLOCK` path with it. `lib.rs` is
+down to roughly half its peak size. More groups move the same way as they're
+touched next — the pub/sub and transaction helpers are the biggest remaining
+chunks.
 
 ```sh
 cargo test              # parser unit tests + end-to-end integration tests
