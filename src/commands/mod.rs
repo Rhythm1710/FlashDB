@@ -8,11 +8,14 @@
 //! they share, which only ever talk to a [`crate::Server`] and the `rdb`
 //! module — nothing about them depends on any other command group. `lists`
 //! and `hashes` follow the same pattern for `RPUSH`/`LPUSH`/`RPOP`/`LPOP`/
-//! `LLEN`/`LRANGE` and `HSET`/`HGET`/`HGETALL`/`HDEL`. Future sessions can
-//! keep peeling groups out the same way (streams, pub/sub, transactions)
-//! until `lib.rs` is just wiring: the connection loop and the
-//! `process_command` dispatch table.
+//! `LLEN`/`LRANGE` and `HSET`/`HGET`/`HGETALL`/`HDEL`. `streams` is the
+//! biggest group yet — `XADD`/`XLEN`/`XRANGE`/`XREVRANGE`/`XDEL`/`XTRIM`/
+//! `XREAD` plus the async blocking `XREAD ... BLOCK` path and its
+//! `XReadRequest` request type. Future sessions can keep peeling groups out
+//! the same way (pub/sub, transactions) until `lib.rs` is just wiring: the
+//! connection loop and the `process_command` dispatch table.
 
 pub(crate) mod hashes;
 pub(crate) mod lists;
 pub(crate) mod persistence;
+pub(crate) mod streams;
