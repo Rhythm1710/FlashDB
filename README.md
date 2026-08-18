@@ -354,10 +354,12 @@ helpers) was the first slice out; `src/commands/lists.rs`
 (`RPUSH`/`LPUSH`/`RPOP`/`LPOP`/`LLEN`/`LRANGE`) and `src/commands/hashes.rs`
 (`HSET`/`HGET`/`HGETALL`/`HDEL`) followed, then `src/commands/streams.rs` —
 the biggest group yet — took `XADD`/`XLEN`/`XRANGE`/`XREVRANGE`/`XDEL`/`XTRIM`/
-`XREAD` plus the async blocking `XREAD ... BLOCK` path with it. `lib.rs` is
-down to roughly half its peak size. More groups move the same way as they're
-touched next — the pub/sub and transaction helpers are the biggest remaining
-chunks.
+`XREAD` plus the async blocking `XREAD ... BLOCK` path with it, and
+`src/commands/pubsub.rs` took `SUBSCRIBE`/`UNSUBSCRIBE`/`PUBLISH`, the
+subscriber routing table, and the subscribe-mode connection loop
+(`serve_subscriber`) with it. `lib.rs` is down to well under half its peak
+size. More groups move the same way as they're touched next — the
+transaction helpers are the biggest remaining chunk.
 
 ```sh
 cargo test              # parser unit tests + end-to-end integration tests
