@@ -11,11 +11,14 @@
 //! `LLEN`/`LRANGE` and `HSET`/`HGET`/`HGETALL`/`HDEL`. `streams` is the
 //! biggest group yet — `XADD`/`XLEN`/`XRANGE`/`XREVRANGE`/`XDEL`/`XTRIM`/
 //! `XREAD` plus the async blocking `XREAD ... BLOCK` path and its
-//! `XReadRequest` request type. Future sessions can keep peeling groups out
-//! the same way (pub/sub, transactions) until `lib.rs` is just wiring: the
-//! connection loop and the `process_command` dispatch table.
+//! `XReadRequest` request type. `pubsub` is next — `SUBSCRIBE`/`UNSUBSCRIBE`/
+//! `PUBLISH`, the routing table, and the subscribe-mode connection loop.
+//! Future sessions can keep peeling groups out the same way (transactions)
+//! until `lib.rs` is just wiring: the connection loop and the
+//! `process_command` dispatch table.
 
 pub(crate) mod hashes;
 pub(crate) mod lists;
 pub(crate) mod persistence;
+pub(crate) mod pubsub;
 pub(crate) mod streams;
