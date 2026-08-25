@@ -357,9 +357,12 @@ the biggest group yet — took `XADD`/`XLEN`/`XRANGE`/`XREVRANGE`/`XDEL`/`XTRIM`
 `XREAD` plus the async blocking `XREAD ... BLOCK` path with it, and
 `src/commands/pubsub.rs` took `SUBSCRIBE`/`UNSUBSCRIBE`/`PUBLISH`, the
 subscriber routing table, and the subscribe-mode connection loop
-(`serve_subscriber`) with it. `lib.rs` is down to well under half its peak
-size. More groups move the same way as they're touched next — the
-transaction helpers are the biggest remaining chunk.
+(`serve_subscriber`) with it, and `src/commands/transactions.rs` took
+`MULTI`/`EXEC`/`DISCARD`/`WATCH`/`UNWATCH` and the per-connection `Session`
+they dispatch through — the first group whose state belongs to one
+connection rather than a shared, crate-wide registry. `lib.rs` is now under
+1,400 lines, down from a peak past 4,300 — mostly the connection loop and the
+`process_command` dispatch table.
 
 ```sh
 cargo test              # parser unit tests + end-to-end integration tests
