@@ -32,12 +32,14 @@ fn map_to_rdb_entries(
         if entry.is_expired_at(now) {
             continue; // a key that has already lapsed is not worth persisting
         }
-        if matches!(entry.value, StoredValue::Stream(_)) {
-            // Real Redis persists streams with a listpack/radix-tree encoding we
-            // neither write nor read yet, so a stream is skipped rather than
-            // emitted in a format a real `redis-server` couldn't load. (This
-            // filter is the single source of truth; the exhaustive arms in
-            // `rdb::write` exist only for the type system and never run.)
+        if matches!(entry.value, StoredValue::Stream(_) | StoredValue::ZSet(_)) {
+            // Real Redis persists streams with a listpack/radix-tree encoding,
+            // and sorted sets with their own listpack/skiplist encoding — we
+            // neither write nor read either format yet, so both are skipped
+            // rather than emitted in a shape a real `redis-server` couldn't
+            // load. (This filter is the single source of truth; the
+            // exhaustive arms in `rdb::write` exist only for the type system
+            // and never run.)
             continue;
         }
         let expire_at_ms = entry.expires_at.map(|deadline| {

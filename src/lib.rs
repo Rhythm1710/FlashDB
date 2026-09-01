@@ -21,23 +21,24 @@ mod commands;
 pub mod rdb;
 pub mod replication;
 pub mod resp;
+pub mod sorted_set;
 pub mod stream;
 
 use commands::lists::Side;
 use commands::pubsub::Subscribers;
+use sorted_set::ZSet;
 use stream::Stream;
 
 /// The typed payload a key holds.
 ///
 /// Until now every value was a bare `String`. Redis keys, though, come in
-/// several shapes — strings, lists, hashes, sets — and a command that meets
-/// the wrong shape (e.g. `LPUSH` on a string) must fail with a `WRONGTYPE`
-/// error rather than silently misbehave. Modelling the value as an enum makes
-/// "what kind of thing is stored here?" a fact the compiler tracks for us:
-/// every place that reads a value is forced to say what it does for each
-/// shape. `Str`, `List`, and `Hash` exist today; `Set` joins its variant as
-/// that command lands, at which point the accessors below grow the matching
-/// arms.
+/// several shapes — strings, lists, hashes, streams, sorted sets — and a
+/// command that meets the wrong shape (e.g. `LPUSH` on a string) must fail
+/// with a `WRONGTYPE` error rather than silently misbehave. Modelling the
+/// value as an enum makes "what kind of thing is stored here?" a fact the
+/// compiler tracks for us: every place that reads a value is forced to say
+/// what it does for each shape. `Str`, `List`, `Hash`, `Stream`, and `ZSet`
+/// exist today; a plain unordered `Set` is still to come.
 #[derive(Debug, PartialEq, Clone)]
 pub enum StoredValue {
     Str(String),
@@ -50,21 +51,26 @@ pub enum StoredValue {
     /// (real Redis makes no ordering promise for small hashes either).
     Hash(HashMap<String, String>),
     /// A stream: an append-only log of entries keyed by a monotonically
-    /// increasing `<ms>-<seq>` ID (see [`crate::stream`]). This is the fourth
-    /// value type; `Set` is still to come.
+    /// increasing `<ms>-<seq>` ID (see [`crate::stream`]).
     Stream(Stream),
+    /// A sorted set: unique members each tagged with a floating-point score,
+    /// kept in ascending score order (see [`crate::sorted_set`]). The fifth
+    /// value type; a plain unordered `Set` is still to come.
+    ZSet(ZSet),
 }
 
 impl StoredValue {
     /// The Redis type name reported by the `TYPE` command: `string`, `list`,
-    /// `hash`, and in future `set`. A missing key is handled by the caller
-    /// (Redis reports `none`), so there is no variant for it here.
+    /// `hash`, `stream`, `zset`, and in future `set`. A missing key is handled
+    /// by the caller (Redis reports `none`), so there is no variant for it
+    /// here.
     fn type_name(&self) -> &'static str {
         match self {
             StoredValue::Str(_) => "string",
             StoredValue::List(_) => "list",
             StoredValue::Hash(_) => "hash",
             StoredValue::Stream(_) => "stream",
+            StoredValue::ZSet(_) => "zset",
         }
     }
 }
