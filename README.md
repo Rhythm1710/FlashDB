@@ -85,6 +85,10 @@ starting.
 - `XDEL key id [id ...]`
 - `XTRIM key MAXLEN [=|~] threshold`
 - `XREAD [COUNT count] [BLOCK ms] STREAMS key [key ...] id [id ...]`
+- `ZADD key score member [score member ...]`
+- `ZSCORE key member`
+- `ZRANK key member`
+- `ZRANGE key start stop [WITHSCORES]`
 
 ## Transactions
 
@@ -207,14 +211,46 @@ Streams are not yet persisted to RDB (real Redis uses a listpack/radix-tree
 encoding FlashDB does not emit yet), and the consumer-group commands
 (`XACK`/`XCLAIM`/…) are still to come.
 
+## Sorted sets
+
+A **sorted set** holds unique string members, each tagged with a
+floating-point score, kept in ascending order by score (ties broken by
+comparing the members themselves).
+
+`ZADD key score member [score member ...]` sets one or more members' scores,
+creating the set on first use, and returns how many members were *newly
+added* — same counting rule as `HSET`: re-adding an existing member just
+updates its score and doesn't count. Scores are parsed as doubles (`inf` and
+`-inf` are accepted; `nan` is rejected, since a score has to compare against
+every other score to have a place in the order).
+
+`ZSCORE key member` returns a member's current score as a bulk string (a
+whole-number score prints without a trailing `.0`), or null if the member or
+the key is missing. `ZRANK key member` returns the member's 0-based rank in
+ascending order, or null the same way.
+
+`ZRANGE key start stop [WITHSCORES]` returns the members whose ranks fall in
+the inclusive range `[start, stop]`. Indices are zero-based and may be
+negative to count back from the end — `ZRANGE key 0 -1` returns every member
+— with the same clamping rules as `LRANGE`: an out-of-range bound clamps to
+the nearest valid one, and an inverted span (after clamping) yields an empty
+array. Adding `WITHSCORES` interleaves each member with its formatted score.
+
+Members are kept in two structures under the hood — a `HashMap` for O(1)
+`ZSCORE` lookups, and a `Vec` sorted by `(score, member)` that `ZRANK` and
+`ZRANGE` binary-search with `partition_point`, the same trick streams use for
+`XRANGE`. Sorted sets are not yet persisted to RDB (real Redis uses its own
+listpack/skiplist encoding), and `ZREM`/`ZINCRBY`/`ZCARD`/range-by-score are
+still to come.
+
 ## Value types
 
-Every key holds a typed value — a `string`, a `list`, a `hash`, or a `stream`
-today, with sets to follow. Values are modelled as an enum, so a command that
-meets the wrong type (say `GET` on a list, or `LPUSH` on a string) replies with
-a `WRONGTYPE` error instead of misbehaving. `TYPE key` reports the kind of value
-stored: `string`, `list`, `hash`, `stream`, or `none` if the key is missing or
-has expired.
+Every key holds a typed value — a `string`, a `list`, a `hash`, a `stream`, or
+a `zset` today, with a plain unordered `set` still to follow. Values are
+modelled as an enum, so a command that meets the wrong type (say `GET` on a
+list, or `LPUSH` on a string) replies with a `WRONGTYPE` error instead of
+misbehaving. `TYPE key` reports the kind of value stored: `string`, `list`,
+`hash`, `stream`, `zset`, or `none` if the key is missing or has expired.
 
 ## Lists
 
@@ -362,7 +398,10 @@ subscriber routing table, and the subscribe-mode connection loop
 they dispatch through — the first group whose state belongs to one
 connection rather than a shared, crate-wide registry. `lib.rs` is now under
 1,400 lines, down from a peak past 4,300 — mostly the connection loop and the
-`process_command` dispatch table.
+`process_command` dispatch table. `src/commands/sorted_sets.rs`
+(`ZADD`/`ZSCORE`/`ZRANK`/`ZRANGE`) is the first new command group written
+directly in `src/commands/` rather than lifted out of `lib.rs`, following the
+same pattern the split established.
 
 ```sh
 cargo test              # parser unit tests + end-to-end integration tests
