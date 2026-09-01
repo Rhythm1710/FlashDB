@@ -13,15 +13,18 @@
 //! `XREAD` plus the async blocking `XREAD ... BLOCK` path and its
 //! `XReadRequest` request type. `pubsub` follows — `SUBSCRIBE`/`UNSUBSCRIBE`/
 //! `PUBLISH`, the routing table, and the subscribe-mode connection loop.
-//! `transactions` is last — `MULTI`/`EXEC`/`DISCARD`/`WATCH`/`UNWATCH` and the
+//! `transactions` followed — `MULTI`/`EXEC`/`DISCARD`/`WATCH`/`UNWATCH` and the
 //! per-connection `Session` they dispatch through, the first group whose state
-//! is private to one connection rather than a crate-wide registry. With it out,
-//! `lib.rs` is down to wiring: the connection loop and the `process_command`
-//! dispatch table.
+//! is private to one connection rather than a crate-wide registry. With it
+//! out, `lib.rs` settled into wiring: the connection loop and the
+//! `process_command` dispatch table. `sorted_sets` is the first genuinely new
+//! command group added after the split rather than lifted out of `lib.rs` —
+//! `ZADD`/`ZSCORE`/`ZRANK`/`ZRANGE`, following the same pattern from day one.
 
 pub(crate) mod hashes;
 pub(crate) mod lists;
 pub(crate) mod persistence;
 pub(crate) mod pubsub;
+pub(crate) mod sorted_sets;
 pub(crate) mod streams;
 pub(crate) mod transactions;

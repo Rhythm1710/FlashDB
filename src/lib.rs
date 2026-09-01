@@ -609,6 +609,10 @@ pub fn process_command(value: Value, server: &Server) -> Value {
         "xdel" => commands::streams::xdel(&args, storage),
         "xtrim" => commands::streams::xtrim(&args, storage),
         "xread" => commands::streams::xread(&args, storage),
+        "zadd" => commands::sorted_sets::zadd(&args, storage),
+        "zscore" => commands::sorted_sets::zscore(&args, storage),
+        "zrank" => commands::sorted_sets::zrank(&args, storage),
+        "zrange" => commands::sorted_sets::zrange(&args, storage),
         "save" => commands::persistence::save(&args, server),
         "bgsave" => commands::persistence::bgsave(&args, server),
         // A replica announces its listening port and capabilities with REPLCONF
@@ -697,6 +701,7 @@ fn is_write_command(name: &str) -> bool {
             | "xadd"
             | "xdel"
             | "xtrim"
+            | "zadd"
     )
 }
 
@@ -986,7 +991,7 @@ mod tests {
     fn write_commands_are_classified_for_replication() {
         for w in [
             "set", "del", "expire", "persist", "rpush", "lpush", "rpop", "lpop", "hset", "hdel",
-            "xadd", "xdel", "xtrim",
+            "xadd", "xdel", "xtrim", "zadd",
         ] {
             assert!(is_write_command(w), "{w} should replicate");
         }
@@ -1009,6 +1014,9 @@ mod tests {
             "xrange",
             "xrevrange",
             "xread",
+            "zscore",
+            "zrank",
+            "zrange",
         ] {
             assert!(!is_write_command(r), "{r} should not replicate");
         }
