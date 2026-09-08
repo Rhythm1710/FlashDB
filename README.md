@@ -89,6 +89,9 @@ starting.
 - `ZSCORE key member`
 - `ZRANK key member`
 - `ZRANGE key start stop [WITHSCORES]`
+- `ZCARD key`
+- `ZREM key member [member ...]`
+- `ZINCRBY key increment member`
 
 ## Transactions
 
@@ -236,12 +239,23 @@ negative to count back from the end — `ZRANGE key 0 -1` returns every member
 the nearest valid one, and an inverted span (after clamping) yields an empty
 array. Adding `WITHSCORES` interleaves each member with its formatted score.
 
+`ZCARD key` returns how many members the set holds, or `0` for a missing key.
+`ZREM key member [member ...]` removes the named members and returns how many
+were actually present; like `HDEL`, an emptied set is removed from the
+keyspace rather than left behind empty. `ZINCRBY key increment member` adds
+`increment` to a member's score — treating an absent member as starting at
+`0`, and creating the set on first use — and returns the new score; a bad
+increment fails the same way a bad `ZADD` score does, and the rare case where
+the arithmetic itself produces `NaN` (`inf` plus `-inf`) is rejected without
+touching the member's existing score.
+
 Members are kept in two structures under the hood — a `HashMap` for O(1)
-`ZSCORE` lookups, and a `Vec` sorted by `(score, member)` that `ZRANK` and
-`ZRANGE` binary-search with `partition_point`, the same trick streams use for
-`XRANGE`. Sorted sets are not yet persisted to RDB (real Redis uses its own
-listpack/skiplist encoding), and `ZREM`/`ZINCRBY`/`ZCARD`/range-by-score are
-still to come.
+`ZSCORE`/`ZCARD` lookups, and a `Vec` sorted by `(score, member)` that
+`ZRANK`/`ZRANGE` binary-search with `partition_point` and `ZREM` uses to find
+the entry to remove, the same trick streams use for `XRANGE`. Sorted sets are
+not yet persisted to RDB (real Redis uses its own listpack/skiplist
+encoding), and range-by-score (`ZRANGEBYSCORE`/`ZCOUNT`) and a reverse
+`ZRANGE ... REV` are still to come.
 
 ## Value types
 
