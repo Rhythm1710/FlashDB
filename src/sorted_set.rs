@@ -136,6 +136,25 @@ impl ZSet {
             .map(|r| (r.member.as_str(), r.score))
             .collect()
     }
+
+    /// Remove `member` entirely. Returns `true` if it was present (and is now
+    /// gone), `false` if it wasn't a member to begin with. Mirrors `insert`'s
+    /// two-structure bookkeeping: the `scores` entry and its matching `ranked`
+    /// entry have to come out together, or the two views would disagree with
+    /// each other from then on.
+    pub fn remove(&mut self, member: &str) -> bool {
+        let Some(score) = self.scores.remove(member) else {
+            return false;
+        };
+        let pos = self
+            .ranked
+            .partition_point(|r| cmp_pairs(r.score, &r.member, score, member) == Ordering::Less);
+        // Same reasoning as `rank`: `pos` is where `member` must sit, since we
+        // just confirmed it's present via `scores`.
+        debug_assert_eq!(self.ranked[pos].member, member);
+        self.ranked.remove(pos);
+        true
+    }
 }
 
 #[cfg(test)]
@@ -213,5 +232,26 @@ mod tests {
     fn range_on_an_empty_set_is_empty() {
         let z = ZSet::default();
         assert_eq!(z.range(0, -1), Vec::new());
+    }
+
+    #[test]
+    fn remove_reports_presence_and_drops_the_member() {
+        let mut z = ZSet::default();
+        z.insert("a".to_string(), 1.0);
+        z.insert("b".to_string(), 2.0);
+        assert!(z.remove("a"));
+        assert!(!z.remove("a"), "already gone the second time");
+        assert_eq!(z.score("a"), None);
+        assert_eq!(z.len(), 1);
+        // The remaining member's own position is still correct.
+        assert_eq!(z.rank("b"), Some(0));
+    }
+
+    #[test]
+    fn remove_of_a_missing_member_is_false_and_a_no_op() {
+        let mut z = ZSet::default();
+        z.insert("a".to_string(), 1.0);
+        assert!(!z.remove("nope"));
+        assert_eq!(z.len(), 1);
     }
 }
