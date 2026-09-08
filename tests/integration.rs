@@ -1446,3 +1446,68 @@ async fn xadd_with_maxlen_trims_after_each_add_over_tcp() {
         *2\r\n$3\r\n3-0\r\n*2\r\n$1\r\nk\r\n$1\r\nv\r\n";
     expect_reply(&mut client, expected).await;
 }
+
+#[tokio::test]
+async fn zcard_and_zrem_round_trip_over_tcp() {
+    let addr = start_server().await;
+    let mut client = connect(addr).await;
+
+    // ZADD z 1 a 2 b 3 c -> :3
+    send(
+        &mut client,
+        b"*8\r\n$4\r\nZADD\r\n$1\r\nz\r\n\
+          $1\r\n1\r\n$1\r\na\r\n$1\r\n2\r\n$1\r\nb\r\n$1\r\n3\r\n$1\r\nc\r\n",
+    )
+    .await;
+    expect_reply(&mut client, ":3\r\n").await;
+
+    send(&mut client, b"*2\r\n$5\r\nZCARD\r\n$1\r\nz\r\n").await;
+    expect_reply(&mut client, ":3\r\n").await;
+
+    // Remove one present member and one that was never there.
+    send(
+        &mut client,
+        b"*4\r\n$4\r\nZREM\r\n$1\r\nz\r\n$1\r\na\r\n$4\r\nnope\r\n",
+    )
+    .await;
+    expect_reply(&mut client, ":1\r\n").await;
+    send(&mut client, b"*2\r\n$5\r\nZCARD\r\n$1\r\nz\r\n").await;
+    expect_reply(&mut client, ":2\r\n").await;
+
+    // Removing every remaining member deletes the key entirely.
+    send(
+        &mut client,
+        b"*4\r\n$4\r\nZREM\r\n$1\r\nz\r\n$1\r\nb\r\n$1\r\nc\r\n",
+    )
+    .await;
+    expect_reply(&mut client, ":2\r\n").await;
+    send(&mut client, b"*2\r\n$4\r\nTYPE\r\n$1\r\nz\r\n").await;
+    expect_reply(&mut client, "+none\r\n").await;
+    send(&mut client, b"*2\r\n$5\r\nZCARD\r\n$1\r\nz\r\n").await;
+    expect_reply(&mut client, ":0\r\n").await;
+}
+
+#[tokio::test]
+async fn zincrby_creates_and_then_adjusts_a_score_over_tcp() {
+    let addr = start_server().await;
+    let mut client = connect(addr).await;
+
+    // A fresh member starts from 0.
+    send(
+        &mut client,
+        b"*4\r\n$7\r\nZINCRBY\r\n$1\r\nz\r\n$3\r\n2.5\r\n$1\r\nm\r\n",
+    )
+    .await;
+    expect_reply(&mut client, "$3\r\n2.5\r\n").await;
+
+    // A second increment adds onto the existing score.
+    send(
+        &mut client,
+        b"*4\r\n$7\r\nZINCRBY\r\n$1\r\nz\r\n$4\r\n-1.5\r\n$1\r\nm\r\n",
+    )
+    .await;
+    expect_reply(&mut client, "$1\r\n1\r\n").await;
+
+    send(&mut client, b"*3\r\n$6\r\nZSCORE\r\n$1\r\nz\r\n$1\r\nm\r\n").await;
+    expect_reply(&mut client, "$1\r\n1\r\n").await;
+}

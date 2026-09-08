@@ -212,6 +212,106 @@ pub(crate) fn zrange(args: &[Value], storage: &Store) -> Value {
     }
 }
 
+/// `ZCARD key` — the number of members in the sorted set, or `0` for a
+/// missing key. WRONGTYPE if the key holds something other than a sorted set.
+pub(crate) fn zcard(args: &[Value], storage: &Store) -> Value {
+    if args.len() != 1 {
+        return wrong_args("zcard");
+    }
+    let key = match unpack_bulk_str(&args[0]) {
+        Ok(k) => k,
+        Err(e) => return Value::Error(format!("ERR {}", e)),
+    };
+    let now = Instant::now();
+    let mut store = storage.lock().unwrap();
+    expire_if_due(&mut store, &key, now);
+    match store.get(&key) {
+        None => Value::Integer(0),
+        Some(e) => match &e.value {
+            StoredValue::ZSet(zset) => Value::Integer(zset.len() as i64),
+            _ => wrong_type(),
+        },
+    }
+}
+
+/// `ZREM key member [member ...]` — remove the named members and return how
+/// many were actually present. Like `HDEL`, an emptied set is removed from
+/// the keyspace entirely rather than left behind as an empty value.
+pub(crate) fn zrem(args: &[Value], storage: &Store) -> Value {
+    if args.len() < 2 {
+        return wrong_args("zrem");
+    }
+    let key = match unpack_bulk_str(&args[0]) {
+        Ok(k) => k,
+        Err(e) => return Value::Error(format!("ERR {}", e)),
+    };
+    let mut members = Vec::with_capacity(args.len() - 1);
+    for arg in &args[1..] {
+        match unpack_bulk_str(arg) {
+            Ok(m) => members.push(m),
+            Err(e) => return Value::Error(format!("ERR {}", e)),
+        }
+    }
+
+    let now = Instant::now();
+    let mut store = storage.lock().unwrap();
+    expire_if_due(&mut store, &key, now);
+    let Some(entry) = store.get_mut(&key) else {
+        return Value::Integer(0);
+    };
+    let zset = match &mut entry.value {
+        StoredValue::ZSet(zset) => zset,
+        _ => return wrong_type(),
+    };
+    let removed = members.iter().filter(|m| zset.remove(m)).count();
+    if zset.is_empty() {
+        store.remove(&key);
+    }
+    Value::Integer(removed as i64)
+}
+
+/// `ZINCRBY key increment member` — add `increment` to `member`'s score
+/// (treating a missing member as starting at `0`), creating the set on first
+/// use, and return the new score as a bulk string. Rejects a non-numeric
+/// increment the same way `ZADD` rejects a non-numeric score, plus a
+/// Redis-matching error if the arithmetic itself produces `NaN` (possible
+/// from `inf + -inf`, even though neither operand alone is `NaN`).
+pub(crate) fn zincrby(args: &[Value], storage: &Store) -> Value {
+    if args.len() != 3 {
+        return wrong_args("zincrby");
+    }
+    let key = match unpack_bulk_str(&args[0]) {
+        Ok(k) => k,
+        Err(e) => return Value::Error(format!("ERR {}", e)),
+    };
+    let increment = match parse_score(&args[1]) {
+        Ok(s) => s,
+        Err(e) => return Value::Error(format!("ERR {}", e)),
+    };
+    let member = match unpack_bulk_str(&args[2]) {
+        Ok(m) => m,
+        Err(e) => return Value::Error(format!("ERR {}", e)),
+    };
+
+    let now = Instant::now();
+    let mut store = storage.lock().unwrap();
+    expire_if_due(&mut store, &key, now);
+    let entry = store.entry(key).or_insert_with(|| Entry {
+        value: StoredValue::ZSet(ZSet::default()),
+        expires_at: None,
+    });
+    let zset = match &mut entry.value {
+        StoredValue::ZSet(zset) => zset,
+        _ => return wrong_type(),
+    };
+    let new_score = zset.score(&member).unwrap_or(0.0) + increment;
+    if new_score.is_nan() {
+        return Value::Error("ERR resulting score is not a number (NaN)".to_string());
+    }
+    zset.insert(member, new_score);
+    Value::BulkString(format_score(new_score))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -372,6 +472,9 @@ mod tests {
         assert_eq!(zscore(&[bulk("k"), bulk("m")], &s), wt);
         assert_eq!(zrank(&[bulk("k"), bulk("m")], &s), wt);
         assert_eq!(zrange(&[bulk("k"), bulk("0"), bulk("-1")], &s), wt);
+        assert_eq!(zcard(&[bulk("k")], &s), wt);
+        assert_eq!(zrem(&[bulk("k"), bulk("m")], &s), wt);
+        assert_eq!(zincrby(&[bulk("k"), bulk("1"), bulk("m")], &s), wt);
         // The failed ZADD must not have clobbered the string value.
         assert_eq!(get(&[bulk("k")], &s), Value::BulkString("v".to_string()));
     }
@@ -383,6 +486,104 @@ mod tests {
         assert_eq!(
             type_cmd(&[bulk("z")], &s),
             Value::SimpleString("zset".to_string())
+        );
+    }
+
+    #[test]
+    fn zcard_counts_members_and_is_zero_for_a_missing_key() {
+        let s = store();
+        assert_eq!(zcard(&[bulk("missing")], &s), Value::Integer(0));
+        zadd(&[bulk("z"), bulk("1"), bulk("a"), bulk("2"), bulk("b")], &s);
+        assert_eq!(zcard(&[bulk("z")], &s), Value::Integer(2));
+    }
+
+    #[test]
+    fn zrem_removes_named_members_and_counts_only_ones_present() {
+        let s = store();
+        zadd(
+            &[
+                bulk("z"),
+                bulk("1"),
+                bulk("a"),
+                bulk("2"),
+                bulk("b"),
+                bulk("3"),
+                bulk("c"),
+            ],
+            &s,
+        );
+        assert_eq!(
+            zrem(&[bulk("z"), bulk("a"), bulk("nope"), bulk("c")], &s),
+            Value::Integer(2)
+        );
+        assert_eq!(
+            zrange(&[bulk("z"), bulk("0"), bulk("-1")], &s),
+            Value::Array(vec![bulk("b")])
+        );
+    }
+
+    #[test]
+    fn zrem_deletes_the_key_once_the_set_is_emptied() {
+        let s = store();
+        zadd(&[bulk("z"), bulk("1"), bulk("a")], &s);
+        assert_eq!(zrem(&[bulk("z"), bulk("a")], &s), Value::Integer(1));
+        assert_eq!(
+            type_cmd(&[bulk("z")], &s),
+            Value::SimpleString("none".to_string())
+        );
+        assert_eq!(zcard(&[bulk("z")], &s), Value::Integer(0));
+    }
+
+    #[test]
+    fn zrem_on_a_missing_key_removes_nothing() {
+        let s = store();
+        assert_eq!(zrem(&[bulk("missing"), bulk("a")], &s), Value::Integer(0));
+    }
+
+    #[test]
+    fn zincrby_creates_the_member_starting_from_zero() {
+        let s = store();
+        assert_eq!(
+            zincrby(&[bulk("z"), bulk("2.5"), bulk("m")], &s),
+            Value::BulkString("2.5".to_string())
+        );
+        assert_eq!(
+            zscore(&[bulk("z"), bulk("m")], &s),
+            Value::BulkString("2.5".to_string())
+        );
+    }
+
+    #[test]
+    fn zincrby_adds_to_an_existing_score_and_can_go_negative() {
+        let s = store();
+        zadd(&[bulk("z"), bulk("5"), bulk("m")], &s);
+        assert_eq!(
+            zincrby(&[bulk("z"), bulk("-8"), bulk("m")], &s),
+            Value::BulkString("-3".to_string())
+        );
+    }
+
+    #[test]
+    fn zincrby_rejects_a_non_numeric_increment() {
+        let s = store();
+        assert_eq!(
+            zincrby(&[bulk("z"), bulk("notanumber"), bulk("m")], &s),
+            Value::Error("ERR value is not a valid float".to_string())
+        );
+    }
+
+    #[test]
+    fn zincrby_rejects_an_increment_that_produces_nan() {
+        let s = store();
+        zadd(&[bulk("z"), bulk("inf"), bulk("m")], &s);
+        assert_eq!(
+            zincrby(&[bulk("z"), bulk("-inf"), bulk("m")], &s),
+            Value::Error("ERR resulting score is not a number (NaN)".to_string())
+        );
+        // The member's score must be untouched by the rejected increment.
+        assert_eq!(
+            zscore(&[bulk("z"), bulk("m")], &s),
+            Value::BulkString("inf".to_string())
         );
     }
 }
