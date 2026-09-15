@@ -92,6 +92,8 @@ starting.
 - `ZCARD key`
 - `ZREM key member [member ...]`
 - `ZINCRBY key increment member`
+- `ZRANGEBYSCORE key min max [WITHSCORES]`
+- `ZCOUNT key min max`
 
 ## Transactions
 
@@ -249,13 +251,24 @@ increment fails the same way a bad `ZADD` score does, and the rare case where
 the arithmetic itself produces `NaN` (`inf` plus `-inf`) is rejected without
 touching the member's existing score.
 
+`ZRANGEBYSCORE key min max [WITHSCORES]` returns the members whose *scores*
+(not ranks) fall in `[min, max]`, ascending. `min`/`max` accept `-inf`/`+inf`
+for an open-ended scan, and either bound can be made exclusive with a leading
+`(` (e.g. `ZRANGEBYSCORE key (1 3` excludes a member scored exactly `1`) —
+the same `(`-prefix convention `XRANGE`/`XREVRANGE` use for stream IDs.
+`ZCOUNT key min max` uses the identical bound grammar and just returns how
+many members qualify, without building the member list.
+
 Members are kept in two structures under the hood — a `HashMap` for O(1)
 `ZSCORE`/`ZCARD` lookups, and a `Vec` sorted by `(score, member)` that
 `ZRANK`/`ZRANGE` binary-search with `partition_point` and `ZREM` uses to find
-the entry to remove, the same trick streams use for `XRANGE`. Sorted sets are
-not yet persisted to RDB (real Redis uses its own listpack/skiplist
-encoding), and range-by-score (`ZRANGEBYSCORE`/`ZCOUNT`) and a reverse
-`ZRANGE ... REV` are still to come.
+the entry to remove, the same trick streams use for `XRANGE`.
+`ZRANGEBYSCORE`/`ZCOUNT` share one more binary search on that same `Vec` —
+`partition_point` on the score alone finds the boundary of a whole run of
+tied scores in one pass, since ties are already grouped together by the
+existing sort order. Sorted sets are not yet persisted to RDB (real Redis
+uses its own listpack/skiplist encoding), and a reverse `ZRANGE ... REV` is
+still to come.
 
 ## Value types
 
