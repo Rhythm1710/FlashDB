@@ -1,4 +1,5 @@
-//! `ZADD`/`ZSCORE`/`ZRANK`/`ZRANGE` — the sorted set commands, following the
+//! `ZADD`/`ZSCORE`/`ZRANK`/`ZRANGE`/`ZCARD`/`ZREM`/`ZINCRBY`/`ZRANGEBYSCORE`/
+//! `ZCOUNT` — the sorted set commands, following the
 //! same `crate::`-reaching pattern as every other group in
 //! [`crate::commands`]. The ordering logic itself lives in
 //! [`crate::sorted_set`]; this module is just RESP argument parsing plus
@@ -26,6 +27,30 @@ fn parse_score(value: &Value) -> Result<f64, String> {
         return Err("value is not a valid float".to_string());
     }
     Ok(score)
+}
+
+/// Parse a `ZRANGEBYSCORE`/`ZCOUNT` min/max bound: a plain score, `-inf` /
+/// `+inf` (or bare `inf` — `f64::from_str` already accepts all three), or the
+/// same score prefixed with `(` to make that end of the range *exclusive* —
+/// Redis's score-range grammar, distinct from `ZADD`'s plain score (which has
+/// no exclusivity marker at all; the `(` here plays the same role
+/// `crate::stream`'s range-bound parsers give it for `XRANGE`/`XREVRANGE`).
+/// Returns `(score, exclusive)`; rejects `nan` the same way `parse_score`
+/// does, but with Redis's own error text for a bad bound (`"min or max is
+/// not a float"`, vs. `parse_score`'s `"value is not a valid float"`).
+fn parse_score_bound(value: &Value) -> Result<(f64, bool), String> {
+    let s = unpack_bulk_str(value).map_err(|e| e.to_string())?;
+    let (rest, exclusive) = match s.strip_prefix('(') {
+        Some(inner) => (inner, true),
+        None => (s.as_str(), false),
+    };
+    let score: f64 = rest
+        .parse()
+        .map_err(|_| "min or max is not a float".to_string())?;
+    if score.is_nan() {
+        return Err("min or max is not a float".to_string());
+    }
+    Ok((score, exclusive))
 }
 
 /// Render a score the way `ZSCORE`/`ZRANGE ... WITHSCORES` report it: a whole
@@ -312,6 +337,97 @@ pub(crate) fn zincrby(args: &[Value], storage: &Store) -> Value {
     Value::BulkString(format_score(new_score))
 }
 
+/// `ZRANGEBYSCORE key min max [WITHSCORES]` — the members whose *scores* fall
+/// in `[min, max]` (ascending order). `min`/`max` accept `-inf`/`+inf` for an
+/// open-ended scan and a leading `(` to make that end exclusive (see
+/// [`parse_score_bound`]) — unlike `ZRANGE`, which ranges over rank, not
+/// score. `WITHSCORES` and the missing-key/WRONGTYPE handling mirror `ZRANGE`
+/// exactly.
+pub(crate) fn zrangebyscore(args: &[Value], storage: &Store) -> Value {
+    if args.len() != 3 && args.len() != 4 {
+        return wrong_args("zrangebyscore");
+    }
+    let key = match unpack_bulk_str(&args[0]) {
+        Ok(k) => k,
+        Err(e) => return Value::Error(format!("ERR {}", e)),
+    };
+    let (min, min_exclusive) = match parse_score_bound(&args[1]) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(format!("ERR {}", e)),
+    };
+    let (max, max_exclusive) = match parse_score_bound(&args[2]) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(format!("ERR {}", e)),
+    };
+    let with_scores = match args.get(3) {
+        None => false,
+        Some(v) => match unpack_bulk_str(v) {
+            Ok(s) if s.eq_ignore_ascii_case("withscores") => true,
+            Ok(_) => return Value::Error("ERR syntax error".to_string()),
+            Err(e) => return Value::Error(format!("ERR {}", e)),
+        },
+    };
+
+    let now = Instant::now();
+    let mut store = storage.lock().unwrap();
+    expire_if_due(&mut store, &key, now);
+    match store.get(&key) {
+        None => Value::Array(Vec::new()),
+        Some(e) => match &e.value {
+            StoredValue::ZSet(zset) => {
+                let items = zset.range_by_score(min, min_exclusive, max, max_exclusive);
+                let mut out = Vec::with_capacity(if with_scores {
+                    items.len() * 2
+                } else {
+                    items.len()
+                });
+                for (member, score) in items {
+                    out.push(Value::BulkString(member.to_string()));
+                    if with_scores {
+                        out.push(Value::BulkString(format_score(score)));
+                    }
+                }
+                Value::Array(out)
+            }
+            _ => wrong_type(),
+        },
+    }
+}
+
+/// `ZCOUNT key min max` — how many members' scores fall in `[min, max]`,
+/// using the same bound grammar as `ZRANGEBYSCORE` (`-inf`/`+inf`, exclusive
+/// `(`). `0` for a missing key.
+pub(crate) fn zcount(args: &[Value], storage: &Store) -> Value {
+    if args.len() != 3 {
+        return wrong_args("zcount");
+    }
+    let key = match unpack_bulk_str(&args[0]) {
+        Ok(k) => k,
+        Err(e) => return Value::Error(format!("ERR {}", e)),
+    };
+    let (min, min_exclusive) = match parse_score_bound(&args[1]) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(format!("ERR {}", e)),
+    };
+    let (max, max_exclusive) = match parse_score_bound(&args[2]) {
+        Ok(v) => v,
+        Err(e) => return Value::Error(format!("ERR {}", e)),
+    };
+
+    let now = Instant::now();
+    let mut store = storage.lock().unwrap();
+    expire_if_due(&mut store, &key, now);
+    match store.get(&key) {
+        None => Value::Integer(0),
+        Some(e) => match &e.value {
+            StoredValue::ZSet(zset) => {
+                Value::Integer(zset.count_by_score(min, min_exclusive, max, max_exclusive) as i64)
+            }
+            _ => wrong_type(),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -475,6 +591,8 @@ mod tests {
         assert_eq!(zcard(&[bulk("k")], &s), wt);
         assert_eq!(zrem(&[bulk("k"), bulk("m")], &s), wt);
         assert_eq!(zincrby(&[bulk("k"), bulk("1"), bulk("m")], &s), wt);
+        assert_eq!(zrangebyscore(&[bulk("k"), bulk("0"), bulk("1")], &s), wt);
+        assert_eq!(zcount(&[bulk("k"), bulk("0"), bulk("1")], &s), wt);
         // The failed ZADD must not have clobbered the string value.
         assert_eq!(get(&[bulk("k")], &s), Value::BulkString("v".to_string()));
     }
@@ -584,6 +702,123 @@ mod tests {
         assert_eq!(
             zscore(&[bulk("z"), bulk("m")], &s),
             Value::BulkString("inf".to_string())
+        );
+    }
+
+    fn seed_zrangebyscore_set(s: &Store) {
+        zadd(
+            &[
+                bulk("z"),
+                bulk("1"),
+                bulk("a"),
+                bulk("2"),
+                bulk("b"),
+                bulk("2"),
+                bulk("c"), // ties "b" on score
+                bulk("3"),
+                bulk("d"),
+            ],
+            s,
+        );
+    }
+
+    #[test]
+    fn zrangebyscore_is_inclusive_by_default() {
+        let s = store();
+        seed_zrangebyscore_set(&s);
+        assert_eq!(
+            zrangebyscore(&[bulk("z"), bulk("2"), bulk("2")], &s),
+            Value::Array(vec![bulk("b"), bulk("c")])
+        );
+        assert_eq!(
+            zrangebyscore(&[bulk("z"), bulk("1"), bulk("3")], &s),
+            Value::Array(vec![bulk("a"), bulk("b"), bulk("c"), bulk("d")])
+        );
+    }
+
+    #[test]
+    fn zrangebyscore_supports_infinities_and_exclusive_bounds() {
+        let s = store();
+        seed_zrangebyscore_set(&s);
+        assert_eq!(
+            zrangebyscore(&[bulk("z"), bulk("-inf"), bulk("+inf")], &s),
+            Value::Array(vec![bulk("a"), bulk("b"), bulk("c"), bulk("d")])
+        );
+        // Exclusive min of 1 drops "a"; exclusive max of 3 drops "d".
+        assert_eq!(
+            zrangebyscore(&[bulk("z"), bulk("(1"), bulk("(3")], &s),
+            Value::Array(vec![bulk("b"), bulk("c")])
+        );
+    }
+
+    #[test]
+    fn zrangebyscore_withscores_interleaves_score_after_each_member() {
+        let s = store();
+        zadd(
+            &[bulk("z"), bulk("1"), bulk("a"), bulk("2.5"), bulk("b")],
+            &s,
+        );
+        assert_eq!(
+            zrangebyscore(
+                &[bulk("z"), bulk("-inf"), bulk("+inf"), bulk("WITHSCORES")],
+                &s
+            ),
+            Value::Array(vec![bulk("a"), bulk("1"), bulk("b"), bulk("2.5")])
+        );
+    }
+
+    #[test]
+    fn zrangebyscore_on_missing_key_is_empty() {
+        let s = store();
+        assert_eq!(
+            zrangebyscore(&[bulk("missing"), bulk("-inf"), bulk("+inf")], &s),
+            Value::Array(Vec::new())
+        );
+    }
+
+    #[test]
+    fn zrangebyscore_rejects_a_bad_bound_or_trailing_option() {
+        let s = store();
+        seed_zrangebyscore_set(&s);
+        assert_eq!(
+            zrangebyscore(&[bulk("z"), bulk("notanumber"), bulk("3")], &s),
+            Value::Error("ERR min or max is not a float".to_string())
+        );
+        assert_eq!(
+            zrangebyscore(&[bulk("z"), bulk("1"), bulk("3"), bulk("NOPE")], &s),
+            Value::Error("ERR syntax error".to_string())
+        );
+    }
+
+    #[test]
+    fn zcount_counts_members_in_the_score_window() {
+        let s = store();
+        seed_zrangebyscore_set(&s);
+        assert_eq!(
+            zcount(&[bulk("z"), bulk("2"), bulk("2")], &s),
+            Value::Integer(2)
+        );
+        assert_eq!(
+            zcount(&[bulk("z"), bulk("-inf"), bulk("+inf")], &s),
+            Value::Integer(4)
+        );
+        assert_eq!(
+            zcount(&[bulk("z"), bulk("(1"), bulk("(3")], &s),
+            Value::Integer(2)
+        );
+    }
+
+    #[test]
+    fn zcount_is_zero_for_a_missing_key_or_empty_window() {
+        let s = store();
+        seed_zrangebyscore_set(&s);
+        assert_eq!(
+            zcount(&[bulk("missing"), bulk("-inf"), bulk("+inf")], &s),
+            Value::Integer(0)
+        );
+        assert_eq!(
+            zcount(&[bulk("z"), bulk("10"), bulk("20")], &s),
+            Value::Integer(0)
         );
     }
 }

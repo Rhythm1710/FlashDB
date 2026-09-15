@@ -616,6 +616,8 @@ pub fn process_command(value: Value, server: &Server) -> Value {
         "zcard" => commands::sorted_sets::zcard(&args, storage),
         "zrem" => commands::sorted_sets::zrem(&args, storage),
         "zincrby" => commands::sorted_sets::zincrby(&args, storage),
+        "zrangebyscore" => commands::sorted_sets::zrangebyscore(&args, storage),
+        "zcount" => commands::sorted_sets::zcount(&args, storage),
         "save" => commands::persistence::save(&args, server),
         "bgsave" => commands::persistence::bgsave(&args, server),
         // A replica announces its listening port and capabilities with REPLCONF
@@ -1023,6 +1025,8 @@ mod tests {
             "zrank",
             "zrange",
             "zcard",
+            "zrangebyscore",
+            "zcount",
         ] {
             assert!(!is_write_command(r), "{r} should not replicate");
         }

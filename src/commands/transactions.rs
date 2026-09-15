@@ -228,6 +228,8 @@ fn is_known_command(name: &str) -> bool {
             | "zcard"
             | "zrem"
             | "zincrby"
+            | "zrangebyscore"
+            | "zcount"
             | "save"
             | "bgsave"
             | "replconf"

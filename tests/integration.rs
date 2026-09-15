@@ -1511,3 +1511,50 @@ async fn zincrby_creates_and_then_adjusts_a_score_over_tcp() {
     send(&mut client, b"*3\r\n$6\r\nZSCORE\r\n$1\r\nz\r\n$1\r\nm\r\n").await;
     expect_reply(&mut client, "$1\r\n1\r\n").await;
 }
+
+#[tokio::test]
+async fn zrangebyscore_and_zcount_scan_by_score_over_tcp() {
+    let addr = start_server().await;
+    let mut client = connect(addr).await;
+
+    // ZADD z 1 a 2 b 2 c 3 d -> :4 ("b" and "c" tie on score 2).
+    send(
+        &mut client,
+        b"*10\r\n$4\r\nZADD\r\n$1\r\nz\r\n\
+          $1\r\n1\r\n$1\r\na\r\n$1\r\n2\r\n$1\r\nb\r\n$1\r\n2\r\n$1\r\nc\r\n$1\r\n3\r\n$1\r\nd\r\n",
+    )
+    .await;
+    expect_reply(&mut client, ":4\r\n").await;
+
+    // Inclusive score window picks up both tied members.
+    send(
+        &mut client,
+        b"*4\r\n$13\r\nZRANGEBYSCORE\r\n$1\r\nz\r\n$1\r\n2\r\n$1\r\n2\r\n",
+    )
+    .await;
+    expect_reply(&mut client, "*2\r\n$1\r\nb\r\n$1\r\nc\r\n").await;
+
+    // Exclusive bounds `(1`/`(3` drop the endpoints "a" and "d".
+    send(
+        &mut client,
+        b"*4\r\n$13\r\nZRANGEBYSCORE\r\n$1\r\nz\r\n$2\r\n(1\r\n$2\r\n(3\r\n",
+    )
+    .await;
+    expect_reply(&mut client, "*2\r\n$1\r\nb\r\n$1\r\nc\r\n").await;
+
+    // ZCOUNT over the full range counts every member.
+    send(
+        &mut client,
+        b"*4\r\n$6\r\nZCOUNT\r\n$1\r\nz\r\n$4\r\n-inf\r\n$4\r\n+inf\r\n",
+    )
+    .await;
+    expect_reply(&mut client, ":4\r\n").await;
+
+    // ZCOUNT with the same exclusive window as above.
+    send(
+        &mut client,
+        b"*4\r\n$6\r\nZCOUNT\r\n$1\r\nz\r\n$2\r\n(1\r\n$2\r\n(3\r\n",
+    )
+    .await;
+    expect_reply(&mut client, ":2\r\n").await;
+}
