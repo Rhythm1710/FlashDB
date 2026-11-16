@@ -42,13 +42,30 @@ flashdb -p 7000 --dir /var/lib/flashdb --dbfilename snapshot.rdb
 current directory and `dump.rdb`; they locate the on-disk snapshot FlashDB loads
 at startup and writes on `SAVE` / `BGSAVE` (see [Persistence](#persistence-rdb)
 below). `--replicaof <host> <port>` starts the server as a replica that syncs
-from a master on boot (see [Replication](#replication) below). An unknown flag or
-a flag missing its value prints a message and exits non-zero rather than
-starting.
+from a master on boot (see [Replication](#replication) below).
+`--requirepass <password>` demands `AUTH` before any other command (see
+[Authentication](#authentication)). An unknown flag or a flag missing its
+value prints a message and exits non-zero rather than starting.
+
+## Authentication
+
+`--requirepass <password>` makes the server refuse every command until that
+connection sends `AUTH <password>`. Until then the reply is
+`-NOAUTH Authentication required.` `AUTH` with the wrong password replies
+`-WRONGPASS invalid username-password pair or user is disabled.` and leaves
+the connection unauthenticated, including a connection that had already
+logged in. Authentication is per connection: one client logging in does not
+unlock any other. With no `--requirepass`, `AUTH` replies with an error and
+every other command runs as usual.
+
+The built-in replica handshake does not send `AUTH`, so a master started with
+`--requirepass` rejects a `--replicaof` replica until a master password is
+wired up.
 
 ## Implemented commands
 
 - `PING`
+- `AUTH password`
 - `ECHO`
 - `SET key value [EX seconds | PX milliseconds]`
 - `GET`

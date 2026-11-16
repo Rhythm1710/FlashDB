@@ -272,6 +272,7 @@ mod tests {
             dir: dir.to_string_lossy().into_owned(),
             dbfilename: "dump.rdb".to_string(),
             replicaof: None,
+            requirepass: None,
         };
         let reloaded = load_store_from_rdb(&cfg).unwrap();
 
