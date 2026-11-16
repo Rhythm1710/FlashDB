@@ -1558,3 +1558,75 @@ async fn zrangebyscore_and_zcount_scan_by_score_over_tcp() {
     .await;
     expect_reply(&mut client, ":2\r\n").await;
 }
+
+fn resp_cmd(parts: &[&str]) -> Vec<u8> {
+    let mut out = format!("*{}\r\n", parts.len()).into_bytes();
+    for part in parts {
+        out.extend_from_slice(format!("${}\r\n{part}\r\n", part.len()).as_bytes());
+    }
+    out
+}
+
+/// Read one short reply that ends at the first CRLF. Used for `DBSIZE`, whose
+/// integer changes from poll to poll.
+async fn read_line(stream: &mut TcpStream) -> String {
+    let mut got = Vec::new();
+    let mut chunk = [0u8; 64];
+    loop {
+        let n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut chunk))
+            .await
+            .expect("timed out waiting for reply")
+            .expect("read failed");
+        assert_ne!(n, 0, "server closed connection early");
+        got.extend_from_slice(&chunk[..n]);
+        if got.windows(2).any(|window| window == b"\r\n") {
+            break;
+        }
+    }
+    String::from_utf8(got).unwrap()
+}
+
+#[tokio::test]
+async fn active_expiry_removes_keys_nobody_reads() {
+    let addr = start_server().await;
+    let mut client = connect(addr).await;
+
+    send(&mut client, &resp_cmd(&["SET", "keep", "v"])).await;
+    expect_reply(&mut client, "+OK\r\n").await;
+    send(
+        &mut client,
+        &resp_cmd(&["SET", "later", "v", "EX", "10000"]),
+    )
+    .await;
+    expect_reply(&mut client, "+OK\r\n").await;
+    for i in 0..30 {
+        let key = format!("e{i}");
+        // Long enough that the setup itself cannot outrun the deadline, short
+        // enough that the poll below sees the sweep within a few seconds.
+        send(&mut client, &resp_cmd(&["SET", &key, "v", "PX", "1500"])).await;
+        expect_reply(&mut client, "+OK\r\n").await;
+    }
+    // DBSIZE counts keys still resident, including ones not yet swept.
+    send(&mut client, &resp_cmd(&["DBSIZE"])).await;
+    expect_reply(&mut client, ":32\r\n").await;
+
+    let mut last = String::new();
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        send(&mut client, &resp_cmd(&["DBSIZE"])).await;
+        last = read_line(&mut client).await;
+        if last == ":2\r\n" {
+            break;
+        }
+    }
+    assert_eq!(
+        last, ":2\r\n",
+        "the sweep should drop expired keys without a client reading them"
+    );
+    send(&mut client, &resp_cmd(&["GET", "keep"])).await;
+    expect_reply(&mut client, "$1\r\nv\r\n").await;
+    send(&mut client, &resp_cmd(&["GET", "later"])).await;
+    expect_reply(&mut client, "$1\r\nv\r\n").await;
+    send(&mut client, &resp_cmd(&["GET", "e0"])).await;
+    expect_reply(&mut client, "$-1\r\n").await;
+}

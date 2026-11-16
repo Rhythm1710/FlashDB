@@ -209,6 +209,7 @@ fn is_known_command(name: &str) -> bool {
             | "del"
             | "expire"
             | "ttl"
+            | "dbsize"
             | "persist"
             | "type"
             | "rpush"

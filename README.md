@@ -55,6 +55,7 @@ starting.
 - `DEL`
 - `EXPIRE key seconds`
 - `TTL key`
+- `DBSIZE`
 - `PERSIST key`
 - `TYPE key`
 - `RPUSH key value [value ...]`
@@ -318,9 +319,14 @@ one on an existing key. `TTL key` returns the seconds remaining (`-1` if the
 key has no expiry, `-2` if it doesn't exist), and `PERSIST key` removes an
 expiry so the key lives forever again.
 
-Expiry is *passive*: a key past its deadline stays in memory until something
-touches it, at which point the read drops it and reports it as missing — so an
-expired key is indistinguishable from one that was never set.
+Expiry is checked two ways. A read of a key past its deadline drops it and
+reports it missing (passive expiry), so an expired key is indistinguishable
+from one that was never set. A background sweep also samples keys that carry
+a TTL — 20 at a time, and again while more than a quarter of the sample is
+already expired, the same rule Redis uses — and deletes the ones it finds
+due, so a key nobody reads still leaves memory. The sweep runs about every
+100ms. `DBSIZE` reports how many keys are stored, including expired ones the
+sweep has not removed yet; calling it does not expire anything itself.
 
 ## Persistence (RDB)
 

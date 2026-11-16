@@ -116,11 +116,92 @@ pub type Store = Arc<Mutex<HashMap<String, Entry>>>;
 
 /// Passive expiry: if `key` is present but its deadline has passed as of
 /// `now`, drop it. Called before every read so an expired key is
-/// indistinguishable from a missing one, exactly as Redis behaves.
+/// indistinguishable from a missing one. The background sweep
+/// ([`active_expire_sample`]) deletes expired keys even when nobody reads
+/// them; this path still runs so a key that expired between sweeps is not
+/// readable.
 fn expire_if_due(map: &mut HashMap<String, Entry>, key: &str, now: Instant) {
     if matches!(map.get(key), Some(e) if e.is_expired_at(now)) {
         map.remove(key);
     }
+}
+
+/// How many keys that carry a TTL one sampling pass inspects. Redis's
+/// `ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_LOOP` default is 20.
+const EXPIRE_SAMPLE_SIZE: usize = 20;
+/// A pass that finds more expired keys than this percentage of its sample
+/// runs again immediately. Redis stops at 25% or below (`expired * 100 /
+/// sampled > 25` continues).
+const EXPIRE_CYCLE_SLOW_PERCENT: usize = 25;
+/// Cap on back-to-back passes so one tick cannot scan forever when the
+/// keyspace is mostly expired. Sixteen passes of 20 cover 320 deletions.
+const EXPIRE_CYCLE_MAX_PASSES: usize = 16;
+
+fn expire_rng(state: &mut u64) -> u64 {
+    let mut x = *state;
+    if x == 0 {
+        x = 0x9E37_79B9_7F4A_7C15;
+    }
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    *state = x;
+    x
+}
+
+/// Active expiry, Redis-style: sample keys that have a deadline and delete
+/// the ones already due as of `now`. When more than a quarter of the sample
+/// was expired, sample again, up to [`EXPIRE_CYCLE_MAX_PASSES`]. Keys with
+/// no TTL are never part of the sample, so a keyspace of immortal keys costs
+/// one scan to discover there is nothing to do.
+fn active_expire_sample(map: &mut HashMap<String, Entry>, now: Instant, rng: &mut u64) {
+    for _ in 0..EXPIRE_CYCLE_MAX_PASSES {
+        let expiring: Vec<String> = map
+            .iter()
+            .filter(|(_, entry)| entry.expires_at.is_some())
+            .map(|(key, _)| key.clone())
+            .collect();
+        if expiring.is_empty() {
+            return;
+        }
+        let sample_n = EXPIRE_SAMPLE_SIZE.min(expiring.len());
+        // Partial Fisher–Yates: the first `sample_n` slots become a random
+        // sample without replacement.
+        let mut order: Vec<usize> = (0..expiring.len()).collect();
+        for i in 0..sample_n {
+            let span = expiring.len() - i;
+            let j = i + (expire_rng(rng) as usize % span);
+            order.swap(i, j);
+        }
+        let mut expired = 0usize;
+        for idx in order.into_iter().take(sample_n) {
+            let key = &expiring[idx];
+            if map.get(key).is_some_and(|entry| entry.is_expired_at(now)) {
+                map.remove(key);
+                expired += 1;
+            }
+        }
+        if expired * 100 / sample_n <= EXPIRE_CYCLE_SLOW_PERCENT {
+            return;
+        }
+    }
+}
+
+/// Drop expired keys every 100ms, the same cadence Redis's `hz 10` cron
+/// uses, so a key nobody reads still leaves memory. The task holds the
+/// store lock only for the sample itself.
+fn spawn_expire_sweep(store: Store) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_millis(100));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut rng = 0xA5A5_F00D_u64;
+        loop {
+            ticker.tick().await;
+            let now = Instant::now();
+            let mut map = store.lock().unwrap();
+            active_expire_sample(&mut map, now, &mut rng);
+        }
+    });
 }
 
 /// Startup configuration parsed from the command-line arguments.
@@ -399,6 +480,7 @@ pub async fn run_with_config(listener: TcpListener, config: &Config) -> Result<(
 /// `Arc` handle bump) into every connection task. This never returns under
 /// normal operation; an error is only produced if `accept` itself fails.
 async fn serve(listener: TcpListener, server: Server) -> Result<()> {
+    spawn_expire_sweep(Arc::clone(&server.store));
     loop {
         let (stream, _) = listener.accept().await?;
         println!("accepted new connection");
@@ -590,6 +672,7 @@ pub fn process_command(value: Value, server: &Server) -> Value {
         "del" => del(&args, storage),
         "expire" => expire(&args, storage),
         "ttl" => ttl(&args, storage),
+        "dbsize" => dbsize(&args, storage),
         "persist" => persist(&args, storage),
         "type" => type_cmd(&args, storage),
         "rpush" => commands::lists::push(&args, storage, Side::Right),
@@ -885,6 +968,18 @@ fn expire(args: &[Value], storage: &Store) -> Value {
     }
 }
 
+/// `DBSIZE` — how many keys are stored right now.
+///
+/// Unlike `GET` and `TTL`, this does not passively expire anything. A key
+/// whose deadline has passed still counts until the active sweep, or some
+/// other command, removes it.
+fn dbsize(args: &[Value], storage: &Store) -> Value {
+    if !args.is_empty() {
+        return wrong_args("dbsize");
+    }
+    Value::Integer(storage.lock().unwrap().len() as i64)
+}
+
 /// `TTL key` — remaining time to live in seconds. `-2` if the key is missing,
 /// `-1` if it exists but has no expiry, otherwise the seconds left.
 fn ttl(args: &[Value], storage: &Store) -> Value {
@@ -1005,6 +1100,7 @@ mod tests {
         for r in [
             "get",
             "ttl",
+            "dbsize",
             "type",
             "llen",
             "lrange",
@@ -1219,6 +1315,80 @@ mod tests {
         assert_eq!(ttl(&[bulk("k")], &s), Value::Integer(-1));
         expire(&[bulk("k"), bulk("50")], &s);
         assert_eq!(ttl(&[bulk("k")], &s), Value::Integer(50));
+    }
+
+    fn timed(value: &str, expires_at: Option<Instant>) -> Entry {
+        Entry {
+            value: StoredValue::Str(value.to_string()),
+            expires_at,
+        }
+    }
+
+    #[test]
+    fn dbsize_counts_stored_keys_and_rejects_arguments() {
+        let s = store();
+        assert_eq!(dbsize(&[], &s), Value::Integer(0));
+        set(&[bulk("k"), bulk("v")], &s);
+        assert_eq!(dbsize(&[], &s), Value::Integer(1));
+        assert_eq!(dbsize(&[bulk("x")], &s), wrong_args("dbsize"));
+    }
+
+    #[test]
+    fn dbsize_still_counts_a_key_whose_deadline_has_passed() {
+        let s = store();
+        set(&[bulk("gone"), bulk("v"), bulk("PX"), bulk("1")], &s);
+        set(&[bulk("keep"), bulk("v")], &s);
+        std::thread::sleep(Duration::from_millis(5));
+        // Nothing has touched "gone", and DBSIZE itself does not expire, so
+        // both keys are still stored.
+        assert_eq!(dbsize(&[], &s), Value::Integer(2));
+        let mut rng = 1u64;
+        active_expire_sample(&mut s.lock().unwrap(), Instant::now(), &mut rng);
+        assert_eq!(dbsize(&[], &s), Value::Integer(1));
+        assert!(s.lock().unwrap().contains_key("keep"));
+    }
+
+    #[test]
+    fn active_expire_sample_clears_expired_keys_across_passes() {
+        let now = Instant::now();
+        let mut map = HashMap::new();
+        // More expired keys than one sample of 20, so the >25% rule has to
+        // run a second pass or some of them would survive.
+        for i in 0..25 {
+            map.insert(
+                format!("e{i}"),
+                timed("v", Some(now - Duration::from_secs(1))),
+            );
+        }
+        map.insert("keep".to_string(), timed("v", None));
+        map.insert(
+            "later".to_string(),
+            timed("v", Some(now + Duration::from_secs(60))),
+        );
+        let mut rng = 1u64;
+        active_expire_sample(&mut map, now, &mut rng);
+        assert_eq!(
+            map.len(),
+            2,
+            "only the immortal key and the future TTL remain"
+        );
+        assert!(map.contains_key("keep"));
+        assert!(map.contains_key("later"));
+    }
+
+    #[test]
+    fn active_expire_sample_leaves_a_keyspace_of_future_ttls_untouched() {
+        let now = Instant::now();
+        let mut map = HashMap::new();
+        for i in 0..10 {
+            map.insert(
+                format!("k{i}"),
+                timed("v", Some(now + Duration::from_secs(30))),
+            );
+        }
+        let mut rng = 1u64;
+        active_expire_sample(&mut map, now, &mut rng);
+        assert_eq!(map.len(), 10);
     }
 
     #[test]
