@@ -456,11 +456,14 @@ cargo run                       # terminal 1: FlashDB on 127.0.0.1:6379
 cargo run --example ws_bridge   # terminal 2: page + bridge on 127.0.0.1:8080
 ```
 
-Open `http://127.0.0.1:8080`. The page sets a mobile viewport, uses large
-type-and-tap controls so a phone keyboard does not zoom the field, and keeps a
-touch-friendly command history: tap an earlier command to put it back in the
-box. A service worker caches the static files, so the shell still opens after
-the first visit. The bridge listens on `127.0.0.1` unless you pass `--listen`,
+Open `http://127.0.0.1:8080`. The page has four tabs: Home, a command
+reference, a live Instance view that polls `INFO` and `DBSIZE`, and the
+Console. It sets a mobile viewport, uses large type-and-tap controls so a
+phone keyboard does not zoom the field, and keeps a touch-friendly command
+history: tap an earlier command to put it back in the box. The composer and
+tab bar follow `visualViewport`, so the iOS keyboard does not cover them. A
+service worker caches the static files, so the shell still opens after the
+first visit. The bridge listens on `127.0.0.1` unless you pass `--listen`,
 and dials the database given by `--flashdb` (default `127.0.0.1:6379`).
 `--dir` points at the static files when they are somewhere other than the
 `playground/` directory next to the crate.

@@ -1,4 +1,4 @@
-const CACHE = "flashdb-playground-v1";
+const CACHE = "flashdb-playground-v2";
 const ASSETS = [
   "/",
   "/index.html",
