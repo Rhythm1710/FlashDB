@@ -499,11 +499,9 @@ mod tests {
     use super::*;
     use crate::resp::Value;
     use crate::{get, set, type_cmd, wrong_type};
-    use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
 
     fn store() -> Store {
-        Arc::new(Mutex::new(HashMap::new()))
+        crate::empty_store()
     }
 
     fn bulk(s: &str) -> Value {

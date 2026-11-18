@@ -8,7 +8,7 @@
 use anyhow::Result;
 use bytes::Bytes;
 use resp::Value;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -109,18 +109,286 @@ impl Entry {
     }
 }
 
+/// Keys that currently carry a deadline, stored so a sweep can pick a sample
+/// in O(sample) instead of walking the whole keyspace.
+///
+/// `keys` is random-access. `pos` is the index of each key in `keys`, so
+/// insert and remove stay O(1) via swap-remove. FlashDB has no `RENAME`
+/// command; [`Keyspace::rename`] is the update that command must use if it
+/// is added, and it is what tests use to prove a rename keeps the index honest.
+#[derive(Debug, Default)]
+struct ExpiryIndex {
+    keys: Vec<String>,
+    pos: HashMap<String, usize>,
+}
+
+impl ExpiryIndex {
+    fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    fn insert(&mut self, key: String) {
+        if self.pos.contains_key(&key) {
+            return;
+        }
+        self.pos.insert(key.clone(), self.keys.len());
+        self.keys.push(key);
+    }
+
+    fn remove(&mut self, key: &str) {
+        let Some(index) = self.pos.remove(key) else {
+            return;
+        };
+        self.keys.swap_remove(index);
+        if let Some(moved) = self.keys.get(index) {
+            self.pos.insert(moved.clone(), index);
+        }
+    }
+
+    fn key_at(&self, index: usize) -> &str {
+        &self.keys[index]
+    }
+}
+
+/// The keyspace plus the TTL index. One mutex covers both so a write cannot
+/// update a key's deadline and forget the index.
+#[derive(Default)]
+pub struct Keyspace {
+    pub(crate) entries: HashMap<String, Entry>,
+    expiring: ExpiryIndex,
+}
+
+impl Keyspace {
+    fn from_map(entries: HashMap<String, Entry>) -> Self {
+        let mut expiring = ExpiryIndex::default();
+        for (key, entry) in &entries {
+            if entry.expires_at.is_some() {
+                expiring.insert(key.clone());
+            }
+        }
+        Keyspace { entries, expiring }
+    }
+
+    fn get(&self, key: &str) -> Option<&Entry> {
+        self.entries.get(key)
+    }
+
+    fn get_mut(&mut self, key: &str) -> Option<&mut Entry> {
+        self.entries.get_mut(key)
+    }
+
+    fn contains_key(&self, key: &str) -> bool {
+        self.entries.contains_key(key)
+    }
+
+    /// `or_insert_with` for a key that does not exist yet. Callers insert an
+    /// entry with no deadline; an existing key keeps the deadline it had.
+    fn entry(&mut self, key: String) -> std::collections::hash_map::Entry<'_, String, Entry> {
+        self.entries.entry(key)
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Insert `entry`, replacing any previous value, and record whether the
+    /// new value has a deadline. A plain `SET` clears a previous TTL because
+    /// the fresh entry has `expires_at: None`.
+    fn insert(&mut self, key: String, entry: Entry) -> Option<Entry> {
+        let expires = entry.expires_at.is_some();
+        let old = self.entries.insert(key.clone(), entry);
+        if expires {
+            self.expiring.insert(key);
+        } else {
+            self.expiring.remove(&key);
+        }
+        old
+    }
+
+    fn remove(&mut self, key: &str) -> Option<Entry> {
+        self.expiring.remove(key);
+        self.entries.remove(key)
+    }
+
+    /// Re-read `key`'s deadline after a caller changed it through [`get_mut`]
+    /// (`EXPIRE` and `PERSIST` do that).
+    fn sync_expiry(&mut self, key: &str) {
+        let expires = self
+            .entries
+            .get(key)
+            .is_some_and(|entry| entry.expires_at.is_some());
+        if expires {
+            self.expiring.insert(key.to_string());
+        } else {
+            self.expiring.remove(key);
+        }
+    }
+
+    /// Move `from` to `to`, including its TTL-index slot. Overwrites `to`.
+    /// There is no `RENAME` command yet; this is the only rename path, and
+    /// unit tests call it so a future command cannot forget the index.
+    #[allow(dead_code)]
+    fn rename(&mut self, from: &str, to: String) -> bool {
+        let Some(entry) = self.remove(from) else {
+            return false;
+        };
+        self.insert(to, entry);
+        true
+    }
+}
+
 /// The shared key/value store. `Arc` lets every connection task hold a handle
 /// to the same map; `Mutex` serializes the reads and writes. Each value now
 /// carries its own optional expiry (see [`Entry`]).
-pub type Store = Arc<Mutex<HashMap<String, Entry>>>;
+pub type Store = Arc<Mutex<Keyspace>>;
+
+pub(crate) fn empty_store() -> Store {
+    Arc::new(Mutex::new(Keyspace::default()))
+}
 
 /// Passive expiry: if `key` is present but its deadline has passed as of
 /// `now`, drop it. Called before every read so an expired key is
-/// indistinguishable from a missing one, exactly as Redis behaves.
-fn expire_if_due(map: &mut HashMap<String, Entry>, key: &str, now: Instant) {
-    if matches!(map.get(key), Some(e) if e.is_expired_at(now)) {
-        map.remove(key);
+/// indistinguishable from a missing one. The background sweep
+/// ([`expire_one_pass`]) deletes expired keys even when nobody reads
+/// them; this path still runs so a key that expired between sweeps is not
+/// readable. Removal also drops the key from the TTL index.
+fn expire_if_due(space: &mut Keyspace, key: &str, now: Instant) {
+    if matches!(space.get(key), Some(e) if e.is_expired_at(now)) {
+        space.remove(key);
     }
+}
+
+/// How many keys that carry a TTL one sampling pass inspects. Redis's
+/// `ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_LOOP` default is 20.
+const EXPIRE_SAMPLE_SIZE: usize = 20;
+/// A pass that finds more expired keys than this percentage of its sample
+/// runs again immediately. Redis stops at 25% or below (`expired * 100 /
+/// sampled > 25` continues).
+const EXPIRE_CYCLE_SLOW_PERCENT: usize = 25;
+/// Cap on back-to-back passes so one tick cannot scan forever when the
+/// keyspace is mostly expired. Sixteen passes of 20 cover 320 deletions.
+const EXPIRE_CYCLE_MAX_PASSES: usize = 16;
+
+fn expire_rng(state: &mut u64) -> u64 {
+    let mut x = *state;
+    if x == 0 {
+        x = 0x9E37_79B9_7F4A_7C15;
+    }
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    *state = x;
+    x
+}
+
+/// Pick `sample_n` distinct positions in `0..n` without scanning a key list
+/// larger than a small multiple of the sample.
+fn sample_indices(n: usize, sample_n: usize, rng: &mut u64) -> Vec<usize> {
+    if n == 0 || sample_n == 0 {
+        return Vec::new();
+    }
+    if sample_n >= n {
+        return (0..n).collect();
+    }
+    // A short index is still O(sample). A long one is sampled by rejection,
+    // which stays O(sample) when the sample is much smaller than `n`.
+    if n <= sample_n.saturating_mul(4) {
+        let mut order: Vec<usize> = (0..n).collect();
+        for i in 0..sample_n {
+            let span = n - i;
+            let j = i + (expire_rng(rng) as usize % span);
+            order.swap(i, j);
+        }
+        order.truncate(sample_n);
+        return order;
+    }
+    let mut chosen = Vec::with_capacity(sample_n);
+    let mut seen = HashSet::new();
+    let mut spins = 0;
+    while chosen.len() < sample_n && spins < sample_n.saturating_mul(32) {
+        spins += 1;
+        let index = (expire_rng(rng) as usize) % n;
+        if seen.insert(index) {
+            chosen.push(index);
+        }
+    }
+    chosen
+}
+
+/// One Redis-style sample: look at up to [`EXPIRE_SAMPLE_SIZE`] keys that
+/// have a deadline and delete the ones already due. Returns whether another
+/// pass should run (`true` when more than 25% of the sample was expired).
+/// `None` means nothing has a TTL.
+///
+/// The caller holds `space`'s lock for this pass only and drops it before
+/// the next one.
+fn expire_one_pass(space: &mut Keyspace, now: Instant, rng: &mut u64) -> Option<bool> {
+    let n = space.expiring.len();
+    if n == 0 {
+        return None;
+    }
+    let sample_n = EXPIRE_SAMPLE_SIZE.min(n);
+    let indexes = sample_indices(n, sample_n, rng);
+    let keys: Vec<String> = indexes
+        .into_iter()
+        .map(|index| space.expiring.key_at(index).to_string())
+        .collect();
+    let sampled = keys.len();
+    if sampled == 0 {
+        return None;
+    }
+    let mut expired = 0usize;
+    for key in keys {
+        match space.get(&key) {
+            Some(entry) if entry.is_expired_at(now) => {
+                space.remove(&key);
+                expired += 1;
+            }
+            None => space.expiring.remove(&key),
+            Some(_) => {}
+        }
+    }
+    Some(expired * 100 / sampled > EXPIRE_CYCLE_SLOW_PERCENT)
+}
+
+/// Run up to [`EXPIRE_CYCLE_MAX_PASSES`] samples back to back. Used by unit
+/// tests that already hold the keyspace. The background task calls
+/// [`expire_one_pass`] itself so it can drop the mutex between passes.
+#[cfg(test)]
+fn expire_cycle(space: &mut Keyspace, rng: &mut u64) {
+    for _ in 0..EXPIRE_CYCLE_MAX_PASSES {
+        let now = Instant::now();
+        match expire_one_pass(space, now, rng) {
+            None | Some(false) => return,
+            Some(true) => {}
+        }
+    }
+}
+
+/// Drop expired keys every 100ms, the same cadence Redis's `hz 10` cron
+/// uses. Each pass locks only long enough to sample the TTL index; the lock
+/// is released before the next pass. The handle is aborted when [`serve`]
+/// returns — the accept loop has no other shutdown signal.
+fn spawn_expire_sweep(store: Store) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_millis(100));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut rng = 0xA5A5_F00D_u64;
+        loop {
+            ticker.tick().await;
+            for _ in 0..EXPIRE_CYCLE_MAX_PASSES {
+                let now = Instant::now();
+                let again = {
+                    let mut space = store.lock().unwrap();
+                    expire_one_pass(&mut space, now, &mut rng)
+                };
+                match again {
+                    None | Some(false) => break,
+                    Some(true) => {}
+                }
+            }
+        }
+    })
 }
 
 /// Startup configuration parsed from the command-line arguments.
@@ -356,10 +624,7 @@ fn command_args(value: &Value) -> &[Value] {
 /// directory. Use [`run_with_config`] to load an existing RDB snapshot first and
 /// control where snapshots are written.
 pub async fn run(listener: TcpListener) -> Result<()> {
-    let server = Server::new(
-        Arc::new(Mutex::new(HashMap::new())),
-        PathBuf::from("dump.rdb"),
-    );
+    let server = Server::new(empty_store(), PathBuf::from("dump.rdb"));
     serve(listener, server).await
 }
 
@@ -370,7 +635,7 @@ pub async fn run(listener: TcpListener) -> Result<()> {
 pub async fn run_with_config(listener: TcpListener, config: &Config) -> Result<()> {
     let map = load_store_from_rdb(config)?;
     let path = std::path::Path::new(&config.dir).join(&config.dbfilename);
-    let server = Server::new(Arc::new(Mutex::new(map)), path);
+    let server = Server::new(Arc::new(Mutex::new(Keyspace::from_map(map))), path);
 
     // If we were told to replicate, kick off the sync in the background so the
     // handshake with the master runs alongside — not before — us accepting our
@@ -399,6 +664,15 @@ pub async fn run_with_config(listener: TcpListener, config: &Config) -> Result<(
 /// `Arc` handle bump) into every connection task. This never returns under
 /// normal operation; an error is only produced if `accept` itself fails.
 async fn serve(listener: TcpListener, server: Server) -> Result<()> {
+    let sweep = spawn_expire_sweep(Arc::clone(&server.store));
+    let result = accept_loop(listener, server).await;
+    // `accept` returning is the only shutdown this server has (the listener
+    // failed). Stop the sweep so it does not keep waking after that.
+    sweep.abort();
+    result
+}
+
+async fn accept_loop(listener: TcpListener, server: Server) -> Result<()> {
     loop {
         let (stream, _) = listener.accept().await?;
         println!("accepted new connection");
@@ -590,6 +864,7 @@ pub fn process_command(value: Value, server: &Server) -> Value {
         "del" => del(&args, storage),
         "expire" => expire(&args, storage),
         "ttl" => ttl(&args, storage),
+        "dbsize" => dbsize(&args, storage),
         "persist" => persist(&args, storage),
         "type" => type_cmd(&args, storage),
         "rpush" => commands::lists::push(&args, storage, Side::Right),
@@ -876,13 +1151,30 @@ fn expire(args: &[Value], storage: &Store) -> Value {
         store.remove(&key);
         return Value::Integer(1);
     }
-    match store.get_mut(&key) {
-        Some(e) => {
-            e.expires_at = Some(now + Duration::from_secs(secs as u64));
-            Value::Integer(1)
-        }
-        None => Value::Integer(0),
+    let updated = if let Some(entry) = store.get_mut(&key) {
+        entry.expires_at = Some(now + Duration::from_secs(secs as u64));
+        true
+    } else {
+        false
+    };
+    if updated {
+        store.sync_expiry(&key);
+        Value::Integer(1)
+    } else {
+        Value::Integer(0)
     }
+}
+
+/// `DBSIZE` — how many keys are stored right now.
+///
+/// Unlike `GET` and `TTL`, this does not passively expire anything. A key
+/// whose deadline has passed still counts until the active sweep, or some
+/// other command, removes it.
+fn dbsize(args: &[Value], storage: &Store) -> Value {
+    if !args.is_empty() {
+        return wrong_args("dbsize");
+    }
+    Value::Integer(storage.lock().unwrap().len() as i64)
 }
 
 /// `TTL key` — remaining time to live in seconds. `-2` if the key is missing,
@@ -920,12 +1212,18 @@ fn persist(args: &[Value], storage: &Store) -> Value {
     let now = Instant::now();
     let mut store = storage.lock().unwrap();
     expire_if_due(&mut store, &key, now);
-    match store.get_mut(&key) {
-        Some(e) if e.expires_at.is_some() => {
-            e.expires_at = None;
-            Value::Integer(1)
+    let cleared = match store.get_mut(&key) {
+        Some(entry) if entry.expires_at.is_some() => {
+            entry.expires_at = None;
+            true
         }
-        _ => Value::Integer(0),
+        _ => false,
+    };
+    if cleared {
+        store.sync_expiry(&key);
+        Value::Integer(1)
+    } else {
+        Value::Integer(0)
     }
 }
 
@@ -974,7 +1272,7 @@ mod tests {
     use super::*;
 
     fn store() -> Store {
-        Arc::new(Mutex::new(HashMap::new()))
+        empty_store()
     }
 
     fn bulk(s: &str) -> Value {
@@ -1005,6 +1303,7 @@ mod tests {
         for r in [
             "get",
             "ttl",
+            "dbsize",
             "type",
             "llen",
             "lrange",
@@ -1219,6 +1518,111 @@ mod tests {
         assert_eq!(ttl(&[bulk("k")], &s), Value::Integer(-1));
         expire(&[bulk("k"), bulk("50")], &s);
         assert_eq!(ttl(&[bulk("k")], &s), Value::Integer(50));
+    }
+
+    fn timed(value: &str, expires_at: Option<Instant>) -> Entry {
+        Entry {
+            value: StoredValue::Str(value.to_string()),
+            expires_at,
+        }
+    }
+
+    #[test]
+    fn dbsize_counts_stored_keys_and_rejects_arguments() {
+        let s = store();
+        assert_eq!(dbsize(&[], &s), Value::Integer(0));
+        set(&[bulk("k"), bulk("v")], &s);
+        assert_eq!(dbsize(&[], &s), Value::Integer(1));
+        assert_eq!(dbsize(&[bulk("x")], &s), wrong_args("dbsize"));
+    }
+
+    #[test]
+    fn dbsize_still_counts_a_key_whose_deadline_has_passed() {
+        let s = store();
+        set(&[bulk("gone"), bulk("v"), bulk("PX"), bulk("1")], &s);
+        set(&[bulk("keep"), bulk("v")], &s);
+        std::thread::sleep(Duration::from_millis(5));
+        // Nothing has touched "gone", and DBSIZE itself does not expire, so
+        // both keys are still stored.
+        assert_eq!(dbsize(&[], &s), Value::Integer(2));
+        let mut rng = 1u64;
+        expire_cycle(&mut s.lock().unwrap(), &mut rng);
+        assert_eq!(dbsize(&[], &s), Value::Integer(1));
+        assert!(s.lock().unwrap().contains_key("keep"));
+    }
+
+    #[test]
+    fn active_expire_sample_clears_expired_keys_across_passes() {
+        let now = Instant::now();
+        let mut space = Keyspace::default();
+        // More expired keys than one sample of 20, so the >25% rule has to
+        // run a second pass or some of them would survive.
+        for i in 0..25 {
+            space.insert(
+                format!("e{i}"),
+                timed("v", Some(now - Duration::from_secs(1))),
+            );
+        }
+        space.insert("keep".to_string(), timed("v", None));
+        space.insert(
+            "later".to_string(),
+            timed("v", Some(now + Duration::from_secs(60))),
+        );
+        assert_eq!(space.expiring.len(), 26);
+        let mut rng = 1u64;
+        // The deadlines are relative to `now`, so run the passes against that
+        // instant rather than a later clock.
+        for _ in 0..EXPIRE_CYCLE_MAX_PASSES {
+            match expire_one_pass(&mut space, now, &mut rng) {
+                None | Some(false) => break,
+                Some(true) => {}
+            }
+        }
+        assert_eq!(
+            space.len(),
+            2,
+            "only the immortal key and the future TTL remain"
+        );
+        assert!(space.contains_key("keep"));
+        assert!(space.contains_key("later"));
+        assert_eq!(space.expiring.len(), 1);
+    }
+
+    #[test]
+    fn active_expire_sample_leaves_a_keyspace_of_future_ttls_untouched() {
+        let now = Instant::now();
+        let mut space = Keyspace::default();
+        for i in 0..10 {
+            space.insert(
+                format!("k{i}"),
+                timed("v", Some(now + Duration::from_secs(30))),
+            );
+        }
+        let mut rng = 1u64;
+        assert_eq!(expire_one_pass(&mut space, now, &mut rng), Some(false));
+        assert_eq!(space.len(), 10);
+        assert_eq!(space.expiring.len(), 10);
+    }
+
+    #[test]
+    fn expiry_index_tracks_set_expire_persist_del_and_rename() {
+        let s = store();
+        set(&[bulk("a"), bulk("v"), bulk("EX"), bulk("50")], &s);
+        set(&[bulk("b"), bulk("v")], &s);
+        assert_eq!(s.lock().unwrap().expiring.len(), 1);
+        assert_eq!(persist(&[bulk("a")], &s), Value::Integer(1));
+        assert_eq!(s.lock().unwrap().expiring.len(), 0);
+        assert_eq!(expire(&[bulk("b"), bulk("10")], &s), Value::Integer(1));
+        assert_eq!(s.lock().unwrap().expiring.len(), 1);
+        assert!(s.lock().unwrap().rename("b", "c".to_string()));
+        assert!(s.lock().unwrap().get("c").unwrap().expires_at.is_some());
+        assert_eq!(s.lock().unwrap().expiring.len(), 1);
+        assert_eq!(del(&[bulk("c")], &s), Value::Integer(1));
+        assert_eq!(s.lock().unwrap().expiring.len(), 0);
+        // A plain SET replaces an expiring key with one that lives forever.
+        set(&[bulk("d"), bulk("v"), bulk("EX"), bulk("10")], &s);
+        set(&[bulk("d"), bulk("w")], &s);
+        assert_eq!(s.lock().unwrap().expiring.len(), 0);
     }
 
     #[test]

@@ -58,8 +58,8 @@ pub(crate) fn snapshot_bytes(store: &Store) -> Vec<u8> {
     let now = Instant::now();
     let unix_ms = crate::now_unix_ms();
     let entries = {
-        let map = store.lock().unwrap();
-        map_to_rdb_entries(&map, unix_ms, now)
+        let space = store.lock().unwrap();
+        map_to_rdb_entries(&space.entries, unix_ms, now)
     };
     rdb::write::serialize(&entries)
 }
@@ -155,12 +155,11 @@ mod tests {
     use crate::commands::streams::xadd;
     use crate::{load_store_from_rdb, set, Config, StoredValue};
     use bytes::Bytes;
-    use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tokio::sync::mpsc;
 
     fn store() -> Store {
-        Arc::new(Mutex::new(HashMap::new()))
+        crate::empty_store()
     }
 
     fn bulk(s: &str) -> Value {
