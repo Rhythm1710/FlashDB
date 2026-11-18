@@ -50,6 +50,11 @@ impl ZSet {
         self.scores.is_empty()
     }
 
+    /// Rough resident size: each member string plus its score.
+    pub(crate) fn approx_bytes(&self) -> usize {
+        self.scores.keys().map(|member| member.len() + 8).sum()
+    }
+
     /// Set `member`'s score, inserting it if new. Returns `true` if `member`
     /// was not previously a member of the set (Redis's "newly added" count for
     /// `ZADD`), `false` if it already existed and only its score changed.

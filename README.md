@@ -486,6 +486,9 @@ allow another browser origin. Subscribe-mode commands (`SUBSCRIBE`) are a poor
 fit for the one-reply-per-command bridge; ordinary request/response commands are
 what the page is for.
 
+A public demo is a different mode. `ws_bridge --public` gives each browser its
+own database, and the static page can be hosted separately. See [DEPLOY.md](DEPLOY.md).
+
 ## Continuous integration
 
 Every push and pull request against `master` runs the same gate through

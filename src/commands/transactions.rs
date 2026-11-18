@@ -240,6 +240,8 @@ fn is_known_command(name: &str) -> bool {
             | "watch"
             | "unwatch"
             | "publish"
+            | "dbsize"
+            | "info"
     )
 }
 
