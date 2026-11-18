@@ -10,9 +10,13 @@
 //! — plus the byte cursor they read through. The upper one, [`parse_rdb`],
 //! walks the file's header and opcode stream and materialises each key into an
 //! [`RdbEntry`]. Strings, lists, and hashes are understood in their classic
-//! (uncompressed) encodings; the loader turns the entries into live store
-//! entries. The inverse — writing an in-memory keyspace back out — lives in the
-//! [`write`] submodule, so a snapshot FlashDB saves loads straight back in.
+//! (uncompressed) encodings, sorted sets in both the classic string-score
+//! form and the binary-double `ZSET_2` form, and streams in FlashDB's own
+//! record (Redis's listpack stream encoding is still unread). The loader turns
+//! the entries into live store entries. The inverse — writing an in-memory
+//! keyspace back out — lives in the [`write`] submodule, with the stream and
+//! sorted-set payloads themselves encoded by `commands::streams` and
+//! `commands::sorted_sets`, so a snapshot FlashDB saves loads straight back in.
 
 use crate::StoredValue;
 use std::collections::{HashMap, VecDeque};
@@ -37,6 +41,12 @@ pub enum RdbError {
     LzfUnsupported,
     #[error("unsupported RDB value type {0:#04x}")]
     UnsupportedValueType(u8),
+    #[error("duplicate sorted set member")]
+    DuplicateZSetMember,
+    #[error("sorted set score is not a number")]
+    InvalidScore,
+    #[error("stream entry ids are not strictly increasing")]
+    UnsortedStream,
 }
 
 /// A read-only walk through a byte slice, tracking how far we've got.
@@ -56,7 +66,7 @@ impl<'a> Cursor<'a> {
     }
 
     /// Read exactly `n` bytes, returning a borrowed slice into the buffer.
-    fn read_bytes(&mut self, n: usize) -> Result<&'a [u8], RdbError> {
+    pub(crate) fn read_bytes(&mut self, n: usize) -> Result<&'a [u8], RdbError> {
         let end = self.pos.checked_add(n).ok_or(RdbError::UnexpectedEof)?;
         let slice = self
             .data
@@ -67,7 +77,7 @@ impl<'a> Cursor<'a> {
     }
 
     /// Read a single byte.
-    fn read_u8(&mut self) -> Result<u8, RdbError> {
+    pub(crate) fn read_u8(&mut self) -> Result<u8, RdbError> {
         Ok(self.read_bytes(1)?[0])
     }
 
@@ -202,7 +212,15 @@ const OP_EOF: u8 = 0xFF; // end of the keyspace; an 8-byte CRC64 follows
 
 const TYPE_STRING: u8 = 0; // a plain string value
 const TYPE_LIST: u8 = 1; // the classic list encoding: a count then that many strings
+const TYPE_ZSET: u8 = 3; // classic sorted set: member string, score as a decimal string
 const TYPE_HASH: u8 = 4; // the classic hash encoding: a count then that many field/value pairs
+const TYPE_ZSET_2: u8 = 5; // sorted set: member string, score as a little-endian binary double
+/// FlashDB's stream record. Redis stores streams as listpacks in a radix tree
+/// (types 15 / 19 / 21); this byte is unused by Redis, so a `redis-server`
+/// that meets it rejects the snapshot instead of misreading the payload.
+/// FlashDB writes it and reads it back. The layout lives in
+/// [`crate::commands::streams`].
+const TYPE_STREAM: u8 = 0xE0;
 
 /// Parse a whole RDB image into the entries it holds.
 ///
@@ -257,11 +275,12 @@ pub fn parse_rdb(data: &[u8]) -> Result<Vec<RdbEntry>, RdbError> {
     Ok(entries)
 }
 
-/// Decode a single value of the given RDB type. FlashDB understands the three
-/// value types its store can hold — string, list, and hash — in their classic
-/// uncompressed encodings. Any other type number (a modern listpack/quicklist,
-/// a set, a stream, …) is reported rather than misread, so an unsupported dump
-/// fails loudly instead of loading garbage.
+/// Decode a single value of the given RDB type. FlashDB understands strings,
+/// lists, and hashes in their classic uncompressed encodings, sorted sets as
+/// either `ZSET` or `ZSET_2`, and its own stream record. Any other type number
+/// (a modern listpack/quicklist, a plain set, a Redis stream listpack, …) is
+/// reported rather than misread, so an unsupported dump fails loudly instead
+/// of loading garbage.
 fn read_value(cur: &mut Cursor, value_type: u8) -> Result<StoredValue, RdbError> {
     match value_type {
         TYPE_STRING => Ok(StoredValue::Str(read_string(cur)?)),
@@ -285,6 +304,16 @@ fn read_value(cur: &mut Cursor, value_type: u8) -> Result<StoredValue, RdbError>
             }
             Ok(StoredValue::Hash(map))
         }
+        // Sorted-set payloads are decoded next to the `Z*` commands.
+        TYPE_ZSET => Ok(StoredValue::ZSet(crate::commands::sorted_sets::read_zset(
+            cur, false,
+        )?)),
+        TYPE_ZSET_2 => Ok(StoredValue::ZSet(crate::commands::sorted_sets::read_zset(
+            cur, true,
+        )?)),
+        TYPE_STREAM => Ok(StoredValue::Stream(crate::commands::streams::read_stream(
+            cur,
+        )?)),
         other => Err(RdbError::UnsupportedValueType(other)),
     }
 }
@@ -295,7 +324,7 @@ fn read_value(cur: &mut Cursor, value_type: u8) -> Result<StoredValue, RdbError>
 /// silent misread. We don't pre-size collections from this count: a corrupt
 /// huge value would otherwise trigger a giant allocation before the reads that
 /// would fail anyway run out of bytes.
-fn read_count(cur: &mut Cursor) -> Result<u64, RdbError> {
+pub(crate) fn read_count(cur: &mut Cursor) -> Result<u64, RdbError> {
     match read_length(cur)? {
         Length::Plain(n) => Ok(n),
         Length::Special(_) => Err(RdbError::UnsupportedLengthEncoding),
@@ -313,7 +342,8 @@ fn read_count(cur: &mut Cursor) -> Result<u64, RdbError> {
 /// is Redis's own CRC64 variant, into a real `redis-server` too.
 pub mod write {
     use super::{
-        RdbEntry, OP_EOF, OP_EXPIRETIME_MS, OP_SELECTDB, TYPE_HASH, TYPE_LIST, TYPE_STRING,
+        RdbEntry, OP_EOF, OP_EXPIRETIME_MS, OP_SELECTDB, TYPE_HASH, TYPE_LIST, TYPE_STREAM,
+        TYPE_STRING, TYPE_ZSET_2,
     };
     use crate::StoredValue;
 
@@ -367,13 +397,11 @@ pub mod write {
             StoredValue::Str(_) => TYPE_STRING,
             StoredValue::List(_) => TYPE_LIST,
             StoredValue::Hash(_) => TYPE_HASH,
-            // Streams and sorted sets are filtered out before serialization
-            // (see `map_to_rdb_entries`); these arms satisfy the
-            // exhaustiveness checker and are never reached. We tag them as the
-            // string type purely so the function stays total — neither record
-            // is ever emitted.
-            StoredValue::Stream(_) => TYPE_STRING,
-            StoredValue::ZSet(_) => TYPE_STRING,
+            // `ZSET_2`: member strings plus little-endian binary doubles, the
+            // encoding a real `redis-server` loads. Streams use FlashDB's own
+            // type byte; see `TYPE_STREAM`.
+            StoredValue::ZSet(_) => TYPE_ZSET_2,
+            StoredValue::Stream(_) => TYPE_STREAM,
         }
     }
 
@@ -397,12 +425,8 @@ pub mod write {
                     write_string(buf, value);
                 }
             }
-            // Unreachable: streams and sorted sets are dropped from the entry
-            // list before serialization, so `write_payload` is never handed
-            // either one. Writing nothing keeps the function total without
-            // emitting a bogus record.
-            StoredValue::Stream(_) => {}
-            StoredValue::ZSet(_) => {}
+            StoredValue::ZSet(zset) => crate::commands::sorted_sets::write_zset(buf, zset),
+            StoredValue::Stream(stream) => crate::commands::streams::write_stream(buf, stream),
         }
     }
 
@@ -649,6 +673,26 @@ mod tests {
         assert_eq!(parse_rdb(&v), Err(RdbError::UnsupportedValueType(0x02)));
     }
 
+    #[test]
+    fn parses_a_classic_zset_whose_score_is_decimal_text() {
+        let mut v = Vec::new();
+        v.extend_from_slice(b"REDIS0011");
+        v.push(TYPE_ZSET);
+        v.extend_from_slice(&[0x01, b'z']); // key
+        v.push(0x01); // one member
+        v.extend_from_slice(&[0x01, b'a']);
+        v.push(0x03);
+        v.extend_from_slice(b"1.5");
+        v.push(OP_EOF);
+        v.extend_from_slice(&[0; 8]);
+
+        let entries = parse_rdb(&v).unwrap();
+        match &entries[0].value {
+            StoredValue::ZSet(zset) => assert_eq!(zset.score("a"), Some(1.5)),
+            other => panic!("expected a sorted set, got {other:?}"),
+        }
+    }
+
     // A real snapshot produced by `redis-server` 7.0.15 via `SAVE`, captured
     // byte-for-byte. It carries the AUX metadata block, a RESIZEDB hint, three
     // string keys (two of them integer-encoded), one key with a millisecond
@@ -772,6 +816,15 @@ mod tests {
         list.push_back("b".to_string());
         let mut hash = HashMap::new();
         hash.insert("field".to_string(), "value".to_string());
+        let mut stream = crate::stream::Stream::default();
+        stream.append(
+            crate::stream::StreamId { ms: 4, seq: 1 },
+            vec![("name".to_string(), "ada".to_string())],
+        );
+        stream.last_id = crate::stream::StreamId { ms: 8, seq: 0 };
+        let mut zset = crate::sorted_set::ZSet::default();
+        zset.insert("m".to_string(), 1.5);
+        zset.insert("top".to_string(), f64::INFINITY);
 
         let input = vec![
             RdbEntry {
@@ -798,6 +851,16 @@ mod tests {
                 key: "h".to_string(),
                 value: StoredValue::Hash(hash),
                 expire_at_ms: None,
+            },
+            RdbEntry {
+                key: "stream".to_string(),
+                value: StoredValue::Stream(stream),
+                expire_at_ms: None,
+            },
+            RdbEntry {
+                key: "z".to_string(),
+                value: StoredValue::ZSet(zset),
+                expire_at_ms: Some(1_700_000_000_123),
             },
         ];
 

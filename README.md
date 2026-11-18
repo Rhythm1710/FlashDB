@@ -212,9 +212,15 @@ never holds the store lock while waiting, and a single `XADD` wakes every client
 blocked on that stream. Inside a `MULTI`/`EXEC` transaction a `BLOCK` is ignored
 (the queued read runs as a non-blocking pass), matching Redis.
 
-Streams are not yet persisted to RDB (real Redis uses a listpack/radix-tree
-encoding FlashDB does not emit yet), and the consumer-group commands
-(`XACK`/`XCLAIM`/…) are still to come.
+`SAVE` / `BGSAVE` persist a stream: the high-water `last_id`, then every
+surviving entry's id and field/value pairs. The on-disk record is FlashDB's
+own (value type `0xE0`) rather than Redis's listpack/radix-tree encoding,
+which FlashDB still does not read or write. A snapshot that contains a stream
+reloads here — including a high-water mark left behind by `XDEL` / `XTRIM`,
+so a later `XADD` cannot reuse a deleted id — while a real `redis-server`
+rejects that file. A snapshot with no stream keys stays loadable by Redis,
+same as before. The consumer-group commands (`XACK`/`XCLAIM`/…) are still to
+come.
 
 ## Sorted sets
 
@@ -266,9 +272,13 @@ the entry to remove, the same trick streams use for `XRANGE`.
 `ZRANGEBYSCORE`/`ZCOUNT` share one more binary search on that same `Vec` —
 `partition_point` on the score alone finds the boundary of a whole run of
 tied scores in one pass, since ties are already grouped together by the
-existing sort order. Sorted sets are not yet persisted to RDB (real Redis
-uses its own listpack/skiplist encoding), and a reverse `ZRANGE ... REV` is
-still to come.
+existing sort order. Sorted sets are persisted as Redis's `ZSET_2` record
+(a count, then each member as a string and its score as a little-endian
+binary double). FlashDB also reads the older `ZSET` encoding, where the score
+is decimal text with the `253` / `254` / `255` sentinels for NaN and the
+infinities. A snapshot FlashDB writes therefore loads back into FlashDB and
+into an unmodified `redis-server`. A reverse `ZRANGE ... REV` is still to
+come.
 
 ## Value types
 
@@ -349,10 +359,13 @@ started` immediately so the client isn't blocked on the disk (real Redis forks a
 child process for the same effect). Both write the file atomically — to a temp
 file, then a rename — so a crash mid-write never leaves a half-written snapshot.
 
-Strings, lists, and hashes are all serialized, each with its optional expiry.
+Strings, lists, hashes, and sorted sets are serialized in the encodings Redis
+itself uses (sorted sets as `ZSET_2`), each with its optional expiry. Streams
+are serialized too, in the FlashDB record described under [Streams](#streams):
+a snapshot that includes one reloads here, and is rejected by `redis-server`.
 Because the on-disk bytes are real RDB — right down to the CRC64 trailer Redis
-verifies on load — a snapshot FlashDB writes loads straight back into FlashDB
-*and* into an unmodified `redis-server`:
+verifies on load — a snapshot of strings, lists, hashes, and sorted sets loads
+straight back into FlashDB *and* into an unmodified `redis-server`:
 
 ```sh
 redis-cli -p 6379 SET greeting "hello world"
