@@ -128,7 +128,8 @@ fn expire_if_due(map: &mut HashMap<String, Entry>, key: &str, now: Instant) {
 /// These mirror the Redis server flags FlashDB understands so far: `-p`/`--port`
 /// chooses the listening port, `--dir` / `--dbfilename` name where the on-disk
 /// RDB snapshot lives, and `--replicaof <host> <port>` starts the server as a
-/// replica that syncs from a master on boot.
+/// replica that syncs from a master on boot. `--requirepass <password>`
+/// requires `AUTH` before any other command on a connection.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Config {
     pub port: u16,
@@ -139,6 +140,10 @@ pub struct Config {
     /// handshake, and loads the master's snapshot into its own keyspace. `None`
     /// means a normal standalone server. Parsed from `--replicaof <host> <port>`.
     pub replicaof: Option<(String, u16)>,
+    /// When `Some`, a connection must `AUTH` with this exact password before
+    /// any other command runs. `None` (the default) leaves the server open.
+    /// Parsed from `--requirepass <password>`.
+    pub requirepass: Option<String>,
 }
 
 impl Default for Config {
@@ -150,6 +155,7 @@ impl Default for Config {
             dir: ".".to_string(),
             dbfilename: "dump.rdb".to_string(),
             replicaof: None,
+            requirepass: None,
         }
     }
 }
@@ -193,6 +199,7 @@ impl Config {
                         .map_err(|_| format!("invalid master port number '{raw_port}'"))?;
                     config.replicaof = Some((host, port));
                 }
+                "--requirepass" => config.requirepass = Some(value_for(&mut it)?),
                 other => return Err(format!("unknown argument '{other}'")),
             }
         }
@@ -318,6 +325,9 @@ pub struct Server {
     /// streams each time it fires. A single shared `Notify` (rather than one per
     /// stream) is enough because a spurious wake just costs one extra re-check.
     stream_notify: Arc<Notify>,
+    /// `Some` when the process was started with `--requirepass`. `AUTH` on
+    /// each connection compares against it; `None` means no login is required.
+    requirepass: Option<Arc<str>>,
 }
 
 impl Server {
@@ -329,7 +339,17 @@ impl Server {
             versions: Arc::new(Mutex::new(HashMap::new())),
             subscribers: Arc::new(Mutex::new(HashMap::new())),
             stream_notify: Arc::new(Notify::new()),
+            requirepass: None,
         }
+    }
+
+    /// [`Server::new`] plus a `--requirepass` password. `None` is the open
+    /// server `new` builds; `Some` is what `run_with_config` uses when the
+    /// flag was set.
+    fn with_requirepass(store: Store, rdb_path: PathBuf, requirepass: Option<String>) -> Self {
+        let mut server = Self::new(store, rdb_path);
+        server.requirepass = requirepass.map(Arc::from);
+        server
     }
 
     /// The current version of `key`: the number of writes it has seen, or 0 for
@@ -370,7 +390,8 @@ pub async fn run(listener: TcpListener) -> Result<()> {
 pub async fn run_with_config(listener: TcpListener, config: &Config) -> Result<()> {
     let map = load_store_from_rdb(config)?;
     let path = std::path::Path::new(&config.dir).join(&config.dbfilename);
-    let server = Server::new(Arc::new(Mutex::new(map)), path);
+    let server =
+        Server::with_requirepass(Arc::new(Mutex::new(map)), path, config.requirepass.clone());
 
     // If we were told to replicate, kick off the sync in the background so the
     // handshake with the master runs alongside — not before — us accepting our
@@ -419,6 +440,9 @@ async fn handle_conn(stream: TcpStream, server: Server) -> Result<()> {
     // A stable id for this connection, used to track and later remove its
     // subscriptions from the shared pub/sub routing table.
     let client_id = commands::pubsub::NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
+    // No `--requirepass` means the connection is already allowed to run
+    // commands. Otherwise it stays locked until `AUTH` succeeds.
+    let mut authenticated = server.requirepass.is_none();
     loop {
         let value = match handler.read_value().await {
             Ok(Some(v)) => v,
@@ -437,11 +461,36 @@ async fn handle_conn(stream: TcpStream, server: Server) -> Result<()> {
             }
         };
 
+        let name = command_name(&value);
+        // `QUIT` closes the connection. It is allowed before `AUTH` so a
+        // client can hang up without first logging in.
+        if name.as_deref() == Some("quit") {
+            let _ = handler
+                .write_value(Value::SimpleString("OK".to_string()))
+                .await;
+            return Ok(());
+        }
+        // `AUTH` changes this connection's login flag, which lives on the
+        // task rather than in the shared server, so it is handled before
+        // dispatch. Inside `MULTI` it falls through and is queued; `EXEC`
+        // then rejects it, because a queued `AUTH` has no flag to flip.
+        if name.as_deref() == Some("auth") && !session.in_multi {
+            let response = authenticate(&value, server.requirepass.as_deref(), &mut authenticated);
+            handler.write_value(response).await?;
+            continue;
+        }
+        if !authenticated {
+            handler
+                .write_value(Value::Error("NOAUTH Authentication required.".to_string()))
+                .await?;
+            continue;
+        }
+
         // `PSYNC` turns this connection from a normal client into a replica: it
         // leaves the request/response loop for good and becomes a one-way stream
         // of commands the master pushes. Hand the whole connection off to
         // `serve_replica`, which never returns to this loop.
-        if command_name(&value).as_deref() == Some("psync") {
+        if name.as_deref() == Some("psync") {
             return serve_replica(handler, server).await;
         }
 
@@ -453,7 +502,7 @@ async fn handle_conn(stream: TcpStream, server: Server) -> Result<()> {
         // or disconnects. A `SUBSCRIBE` mid-transaction is left to flow into
         // `handle_command` instead, which rejects it like any other command that
         // can't be queued.
-        if command_name(&value).as_deref() == Some("subscribe") && !session.in_multi {
+        if name.as_deref() == Some("subscribe") && !session.in_multi {
             let (mut stream, mut buffer) = handler.into_parts();
             commands::pubsub::serve_subscriber(&mut stream, &mut buffer, &server, client_id, value)
                 .await?;
@@ -581,6 +630,10 @@ pub fn process_command(value: Value, server: &Server) -> Value {
             Some(v) => v.clone(),
             None => Value::SimpleString("PONG".to_string()),
         },
+        // Reached only from `EXEC` of a queued `AUTH`. The connection loop
+        // handles a top-level `AUTH` itself, because the login flag is not
+        // shared server state.
+        "auth" => Value::Error("ERR AUTH can't run inside a transaction".to_string()),
         "echo" => match args.first() {
             Some(v) => v.clone(),
             None => wrong_args("echo"),
@@ -936,6 +989,57 @@ fn wrong_type() -> Value {
     Value::Error("WRONGTYPE Operation against a key holding the wrong kind of value".to_string())
 }
 
+/// `AUTH <password>` or `AUTH <username> <password>` — log this connection in
+/// when `--requirepass` is set.
+///
+/// The only username is `default` (the one-argument form implies it). Any
+/// other username is `WRONGPASS`, and the password is still compared so the
+/// reply does not skip the check. A match sets `authenticated`. A mismatch
+/// clears it, so a connection that was already logged in is logged out again.
+/// With no password configured the command is an error and the flag is left
+/// alone. A wrong number of arguments is also left alone: the password was
+/// never checked.
+fn authenticate(value: &Value, requirepass: Option<&str>, authenticated: &mut bool) -> Value {
+    let args = command_args(value);
+    if args.is_empty() || args.len() > 2 {
+        return wrong_args("auth");
+    }
+    let (username, password) = if args.len() == 1 {
+        (
+            "default".to_string(),
+            match unpack_bulk_str(&args[0]) {
+                Ok(password) => password,
+                Err(e) => return Value::Error(format!("ERR {e}")),
+            },
+        )
+    } else {
+        let username = match unpack_bulk_str(&args[0]) {
+            Ok(username) => username,
+            Err(e) => return Value::Error(format!("ERR {e}")),
+        };
+        let password = match unpack_bulk_str(&args[1]) {
+            Ok(password) => password,
+            Err(e) => return Value::Error(format!("ERR {e}")),
+        };
+        (username, password)
+    };
+    let Some(expected) = requirepass else {
+        return Value::Error("ERR AUTH called without any password configured".to_string());
+    };
+    // Both comparisons run to completion. `subtle` compares the bytes in
+    // constant time when the lengths match, and reports a mismatch when they
+    // do not.
+    let user_ok = subtle::ConstantTimeEq::ct_eq(username.as_bytes(), b"default".as_slice()).into();
+    let pass_ok = subtle::ConstantTimeEq::ct_eq(password.as_bytes(), expected.as_bytes()).into();
+    if user_ok && pass_ok {
+        *authenticated = true;
+        Value::SimpleString("OK".to_string())
+    } else {
+        *authenticated = false;
+        Value::Error("WRONGPASS invalid username-password pair or user is disabled.".to_string())
+    }
+}
+
 fn wrong_args(cmd: &str) -> Value {
     Value::Error(format!(
         "ERR wrong number of arguments for '{}' command",
@@ -1017,6 +1121,7 @@ mod tests {
             "wait",
             "replconf",
             "psync",
+            "auth",
             "xlen",
             "xrange",
             "xrevrange",
@@ -1286,7 +1391,47 @@ mod tests {
         assert_eq!(cfg.port, 6379);
         assert_eq!(cfg.dir, ".");
         assert_eq!(cfg.dbfilename, "dump.rdb");
+        assert_eq!(cfg.requirepass, None);
         assert_eq!(cfg.addr(), "127.0.0.1:6379");
+    }
+
+    #[test]
+    fn config_parses_requirepass() {
+        let cfg = Config::parse(argv(&["--requirepass", "secret"])).unwrap();
+        assert_eq!(cfg.requirepass.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn config_reports_a_missing_requirepass_value() {
+        let err = Config::parse(argv(&["--requirepass"])).unwrap_err();
+        assert_eq!(err, "missing value for --requirepass option");
+    }
+
+    fn auth_frame(parts: &[&str]) -> Value {
+        Value::Array(parts.iter().map(|part| bulk(part)).collect())
+    }
+
+    #[test]
+    fn auth_accepts_the_default_user_and_rejects_any_other() {
+        let mut authed = false;
+        assert_eq!(
+            authenticate(
+                &auth_frame(&["AUTH", "default", "secret"]),
+                Some("secret"),
+                &mut authed
+            ),
+            Value::SimpleString("OK".to_string())
+        );
+        assert!(authed);
+        // A different username fails even when the password bytes match, and
+        // clears a login that was already established.
+        let reply = authenticate(
+            &auth_frame(&["AUTH", "alice", "secret"]),
+            Some("secret"),
+            &mut authed,
+        );
+        assert!(matches!(reply, Value::Error(text) if text.starts_with("WRONGPASS")));
+        assert!(!authed);
     }
 
     #[test]
@@ -1371,6 +1516,7 @@ mod tests {
             dir: "/nonexistent-flashdb-dir".to_string(),
             dbfilename: "nope.rdb".to_string(),
             replicaof: None,
+            requirepass: None,
         };
         let map = load_store_from_rdb(&cfg).expect("a missing file is not an error");
         assert!(map.is_empty());

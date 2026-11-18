@@ -480,6 +480,7 @@ async fn start_server_with_rdb(dir: PathBuf, dbfilename: &str) -> std::net::Sock
         dir: dir.to_string_lossy().into_owned(),
         dbfilename: dbfilename.to_string(),
         replicaof: None,
+        requirepass: None,
     };
     tokio::spawn(async move {
         let _ = flashdb::run_with_config(listener, &config).await;
@@ -724,6 +725,7 @@ async fn start_replica(master_addr: std::net::SocketAddr, tag: &str) -> std::net
         dir: temp_dir(tag).to_string_lossy().into_owned(),
         dbfilename: "dump.rdb".to_string(),
         replicaof: Some((master_addr.ip().to_string(), master_addr.port())),
+        requirepass: None,
     };
     tokio::spawn(async move {
         let _ = flashdb::run_with_config(listener, &config).await;
@@ -1557,6 +1559,154 @@ async fn zrangebyscore_and_zcount_scan_by_score_over_tcp() {
     )
     .await;
     expect_reply(&mut client, ":2\r\n").await;
+}
+
+/// Start a server that loaded no snapshot and, when `password` is `Some`,
+/// requires `AUTH` before any other command.
+async fn start_server_with_password(password: Option<&str>) -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let config = flashdb::Config {
+        port: 0,
+        dir: temp_dir("auth").to_string_lossy().into_owned(),
+        dbfilename: "dump.rdb".to_string(),
+        replicaof: None,
+        requirepass: password.map(str::to_string),
+    };
+    tokio::spawn(async move {
+        let _ = flashdb::run_with_config(listener, &config).await;
+    });
+    addr
+}
+
+#[tokio::test]
+async fn commands_require_auth_until_the_password_matches() {
+    let addr = start_server_with_password(Some("secret")).await;
+    let mut client = connect(addr).await;
+
+    // Nothing runs before AUTH, including a read and a write.
+    send(&mut client, b"*1\r\n$4\r\nPING\r\n").await;
+    expect_reply(&mut client, "-NOAUTH Authentication required.\r\n").await;
+    send(&mut client, b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n").await;
+    expect_reply(&mut client, "-NOAUTH Authentication required.\r\n").await;
+
+    // Wrong arity does not log the client in.
+    send(&mut client, b"*1\r\n$4\r\nAUTH\r\n").await;
+    expect_reply(
+        &mut client,
+        "-ERR wrong number of arguments for 'auth' command\r\n",
+    )
+    .await;
+    send(&mut client, b"*1\r\n$4\r\nPING\r\n").await;
+    expect_reply(&mut client, "-NOAUTH Authentication required.\r\n").await;
+
+    // A wrong password is WRONGPASS and the connection stays locked.
+    send(&mut client, b"*2\r\n$4\r\nAUTH\r\n$4\r\nnope\r\n").await;
+    expect_reply(
+        &mut client,
+        "-WRONGPASS invalid username-password pair or user is disabled.\r\n",
+    )
+    .await;
+    send(&mut client, b"*1\r\n$4\r\nPING\r\n").await;
+    expect_reply(&mut client, "-NOAUTH Authentication required.\r\n").await;
+
+    // The right password unlocks the connection.
+    send(&mut client, b"*2\r\n$4\r\nAUTH\r\n$6\r\nsecret\r\n").await;
+    expect_reply(&mut client, "+OK\r\n").await;
+    send(&mut client, b"*1\r\n$4\r\nPING\r\n").await;
+    expect_reply(&mut client, "+PONG\r\n").await;
+    send(&mut client, b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n").await;
+    expect_reply(&mut client, "+OK\r\n").await;
+    send(&mut client, b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n").await;
+    expect_reply(&mut client, "$1\r\nv\r\n").await;
+
+    // A later wrong AUTH logs the connection out again.
+    send(&mut client, b"*2\r\n$4\r\nAUTH\r\n$4\r\nnope\r\n").await;
+    expect_reply(
+        &mut client,
+        "-WRONGPASS invalid username-password pair or user is disabled.\r\n",
+    )
+    .await;
+    send(&mut client, b"*1\r\n$4\r\nPING\r\n").await;
+    expect_reply(&mut client, "-NOAUTH Authentication required.\r\n").await;
+}
+
+#[tokio::test]
+async fn each_connection_authenticates_on_its_own() {
+    let addr = start_server_with_password(Some("secret")).await;
+    let mut first = connect(addr).await;
+    let mut second = connect(addr).await;
+
+    send(&mut first, b"*2\r\n$4\r\nAUTH\r\n$6\r\nsecret\r\n").await;
+    expect_reply(&mut first, "+OK\r\n").await;
+    // The other socket never sent AUTH, so it is still locked.
+    send(&mut second, b"*1\r\n$4\r\nPING\r\n").await;
+    expect_reply(&mut second, "-NOAUTH Authentication required.\r\n").await;
+    send(&mut first, b"*1\r\n$4\r\nPING\r\n").await;
+    expect_reply(&mut first, "+PONG\r\n").await;
+}
+
+#[tokio::test]
+async fn auth_without_requirepass_is_an_error_and_commands_still_run() {
+    let addr = start_server().await;
+    let mut client = connect(addr).await;
+
+    send(&mut client, b"*1\r\n$4\r\nPING\r\n").await;
+    expect_reply(&mut client, "+PONG\r\n").await;
+    send(&mut client, b"*2\r\n$4\r\nAUTH\r\n$6\r\nsecret\r\n").await;
+    expect_reply(
+        &mut client,
+        "-ERR AUTH called without any password configured\r\n",
+    )
+    .await;
+    // The failed AUTH did not close the connection or lock it.
+    send(&mut client, b"*1\r\n$4\r\nPING\r\n").await;
+    expect_reply(&mut client, "+PONG\r\n").await;
+}
+
+#[tokio::test]
+async fn auth_default_user_succeeds_and_other_usernames_do_not() {
+    let addr = start_server_with_password(Some("secret")).await;
+    let mut client = connect(addr).await;
+
+    // AUTH default <password> is the two-argument form of the same login.
+    send(
+        &mut client,
+        b"*3\r\n$4\r\nAUTH\r\n$7\r\ndefault\r\n$6\r\nsecret\r\n",
+    )
+    .await;
+    expect_reply(&mut client, "+OK\r\n").await;
+    send(&mut client, b"*1\r\n$4\r\nPING\r\n").await;
+    expect_reply(&mut client, "+PONG\r\n").await;
+
+    // A correct password for a username other than default is still WRONGPASS
+    // and logs the connection out.
+    send(
+        &mut client,
+        b"*3\r\n$4\r\nAUTH\r\n$5\r\nalice\r\n$6\r\nsecret\r\n",
+    )
+    .await;
+    expect_reply(
+        &mut client,
+        "-WRONGPASS invalid username-password pair or user is disabled.\r\n",
+    )
+    .await;
+    send(&mut client, b"*1\r\n$4\r\nPING\r\n").await;
+    expect_reply(&mut client, "-NOAUTH Authentication required.\r\n").await;
+}
+
+#[tokio::test]
+async fn quit_is_allowed_before_auth_and_closes_the_connection() {
+    let addr = start_server_with_password(Some("secret")).await;
+    let mut client = connect(addr).await;
+    send(&mut client, b"*1\r\n$4\r\nQUIT\r\n").await;
+    expect_reply(&mut client, "+OK\r\n").await;
+    let mut chunk = [0u8; 8];
+    let n = tokio::time::timeout(Duration::from_secs(2), client.read(&mut chunk))
+        .await
+        .expect("timed out waiting for the connection to close")
+        .expect("read failed");
+    assert_eq!(n, 0, "QUIT should close the connection");
 }
 
 /// Encode a command as a RESP array of bulk strings. Lengths are byte counts,
