@@ -1,0 +1,6 @@
+{
+  "buildCommand": "sh scripts/write-ws-config.sh",
+  "installCommand": "",
+  "outputDirectory": "playground",
+  "framework": null
+}

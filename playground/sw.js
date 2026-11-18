@@ -1,7 +1,8 @@
-const CACHE = "flashdb-playground-v2";
+const CACHE = "flashdb-playground-v3";
 const ASSETS = [
   "/",
   "/index.html",
+  "/config.js",
   "/app.js",
   "/style.css",
   "/manifest.webmanifest",

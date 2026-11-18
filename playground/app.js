@@ -226,9 +226,16 @@ function failQueued(message) {
   while (queue.length) queue.shift().resolve(message);
 }
 
-function connect() {
+function playgroundSocketUrl() {
+  const query = new URLSearchParams(location.search).get("ws");
+  if (query) return query;
+  if (window.FLASHDB_WS_URL) return window.FLASHDB_WS_URL;
   const proto = location.protocol === "https:" ? "wss" : "ws";
-  socket = new WebSocket(`${proto}://${location.host}/ws`);
+  return `${proto}://${location.host}/ws`;
+}
+
+function connect() {
+  socket = new WebSocket(playgroundSocketUrl());
   connected = false;
   setStatus("Connecting…");
   socket.addEventListener("open", () => {
