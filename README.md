@@ -454,6 +454,51 @@ frames parse and serialize correctly (including partial and malformed input),
 and integration tests in `tests/integration.rs` that drive a live server over
 TCP and assert on the raw bytes it sends back.
 
+## Web playground
+
+`playground/` is a small static page for trying commands from a phone or a
+desktop browser. The page and its bridge live outside the server binary:
+`cargo build` produces `flashdb`, which speaks RESP only, and the playground
+is the separate `ws_bridge` example. That example serves the static files and
+accepts a browser WebSocket on `/ws`. Each text frame is one command line
+(whitespace-separated, with double quotes for values that contain spaces); the
+bridge writes it to a FlashDB socket as RESP and sends the reply back as text.
+
+```sh
+cargo run                       # terminal 1: FlashDB on 127.0.0.1:6379
+cargo run --example ws_bridge   # terminal 2: page + bridge on 127.0.0.1:8080
+```
+
+Open `http://127.0.0.1:8080`. The page has four tabs: Home, a command
+reference, a live Instance view that polls `INFO` and `DBSIZE`, and the
+Console. It sets a mobile viewport, uses large type-and-tap controls so a
+phone keyboard does not zoom the field, and keeps a touch-friendly command
+history: tap an earlier command to put it back in the box. The composer and
+tab bar follow `visualViewport`, so the iOS keyboard does not cover them. A
+service worker caches the static files, so the shell still opens after the
+first visit. The bridge listens on `127.0.0.1` unless you pass `--listen`,
+and dials the database given by `--flashdb` (default `127.0.0.1:6379`).
+`--dir` points at the static files when they are somewhere other than the
+`playground/` directory next to the crate.
+
+```sh
+cargo run --example ws_bridge -- --listen 127.0.0.1:8080 --flashdb 127.0.0.1:6379
+```
+
+The bridge is a development proxy. Leave it on localhost unless you trust the
+network it is bound to. To open the playground from a phone on the same LAN,
+bind every interface and browse to this machine's LAN address:
+
+```sh
+cargo run --example ws_bridge -- --listen 0.0.0.0:8080
+```
+
+Then on the phone open `http://<host-LAN-IP>:8080`. `/ws` accepts the page's
+own origin by default. Pass `--allow-origin https://example` (repeatable) to
+allow another browser origin. Subscribe-mode commands (`SUBSCRIBE`) are a poor
+fit for the one-reply-per-command bridge; ordinary request/response commands are
+what the page is for.
+
 ## Continuous integration
 
 Every push and pull request against `master` runs the same gate through
