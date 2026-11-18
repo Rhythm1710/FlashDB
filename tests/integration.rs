@@ -1708,3 +1708,90 @@ async fn quit_is_allowed_before_auth_and_closes_the_connection() {
         .expect("read failed");
     assert_eq!(n, 0, "QUIT should close the connection");
 }
+
+/// Encode a command as a RESP array of bulk strings. Lengths are byte counts,
+/// so this stays correct for any ASCII argument without hand-counting.
+fn resp(parts: &[&str]) -> Vec<u8> {
+    let mut out = format!("*{}\r\n", parts.len()).into_bytes();
+    for part in parts {
+        out.extend_from_slice(format!("${}\r\n{part}\r\n", part.len()).as_bytes());
+    }
+    out
+}
+
+#[tokio::test]
+async fn save_reloads_streams_and_sorted_sets() {
+    let dir = temp_dir("save-stream-zset");
+    let addr = start_server_with_rdb(dir.clone(), "dump.rdb").await;
+    let mut client = connect(addr).await;
+
+    // Two stream entries, then a third that is deleted so the high-water mark
+    // (5-0) outlives the entry itself.
+    send(&mut client, &resp(&["XADD", "s", "1-0", "name", "ada"])).await;
+    expect_reply(&mut client, "$3\r\n1-0\r\n").await;
+    send(
+        &mut client,
+        &resp(&["XADD", "s", "2-1", "name", "grace", "city", "london"]),
+    )
+    .await;
+    expect_reply(&mut client, "$3\r\n2-1\r\n").await;
+    send(&mut client, &resp(&["XADD", "s", "5-0", "temp", "gone"])).await;
+    expect_reply(&mut client, "$3\r\n5-0\r\n").await;
+    send(&mut client, &resp(&["XDEL", "s", "5-0"])).await;
+    expect_reply(&mut client, ":1\r\n").await;
+
+    // A sorted set with an integer score, a fraction, and +inf, plus a TTL
+    // that must survive the snapshot.
+    send(
+        &mut client,
+        &resp(&["ZADD", "z", "1", "a", "2.5", "b", "inf", "top"]),
+    )
+    .await;
+    expect_reply(&mut client, ":3\r\n").await;
+    send(&mut client, &resp(&["EXPIRE", "z", "500"])).await;
+    expect_reply(&mut client, ":1\r\n").await;
+
+    send(&mut client, &resp(&["SAVE"])).await;
+    expect_reply(&mut client, "+OK\r\n").await;
+
+    let addr2 = start_server_with_rdb(dir, "dump.rdb").await;
+    let mut reborn = connect(addr2).await;
+
+    send(&mut reborn, &resp(&["TYPE", "s"])).await;
+    expect_reply(&mut reborn, "+stream\r\n").await;
+    send(&mut reborn, &resp(&["XLEN", "s"])).await;
+    expect_reply(&mut reborn, ":2\r\n").await;
+    send(&mut reborn, &resp(&["XRANGE", "s", "-", "+"])).await;
+    expect_reply(
+        &mut reborn,
+        "*2\r\n\
+         *2\r\n$3\r\n1-0\r\n*2\r\n$4\r\nname\r\n$3\r\nada\r\n\
+         *2\r\n$3\r\n2-1\r\n*4\r\n$4\r\nname\r\n$5\r\ngrace\r\n$4\r\ncity\r\n$6\r\nlondon\r\n",
+    )
+    .await;
+    // The deleted 5-0 id is still the high-water mark, so it cannot be reused.
+    send(&mut reborn, &resp(&["XADD", "s", "5-0", "f", "v"])).await;
+    expect_reply(
+        &mut reborn,
+        "-ERR The ID specified in XADD is equal or smaller than the target stream top item\r\n",
+    )
+    .await;
+    send(&mut reborn, &resp(&["XADD", "s", "5-1", "f", "v"])).await;
+    expect_reply(&mut reborn, "$3\r\n5-1\r\n").await;
+
+    send(&mut reborn, &resp(&["TYPE", "z"])).await;
+    expect_reply(&mut reborn, "+zset\r\n").await;
+    send(
+        &mut reborn,
+        &resp(&["ZRANGE", "z", "0", "-1", "WITHSCORES"]),
+    )
+    .await;
+    expect_reply(
+        &mut reborn,
+        "*6\r\n$1\r\na\r\n$1\r\n1\r\n$1\r\nb\r\n$3\r\n2.5\r\n$3\r\ntop\r\n$3\r\ninf\r\n",
+    )
+    .await;
+    // The absolute deadline came back as a live TTL: PERSIST finds one to strip.
+    send(&mut reborn, &resp(&["PERSIST", "z"])).await;
+    expect_reply(&mut reborn, ":1\r\n").await;
+}
