@@ -462,6 +462,14 @@ async fn handle_conn(stream: TcpStream, server: Server) -> Result<()> {
         };
 
         let name = command_name(&value);
+        // `QUIT` closes the connection. It is allowed before `AUTH` so a
+        // client can hang up without first logging in.
+        if name.as_deref() == Some("quit") {
+            let _ = handler
+                .write_value(Value::SimpleString("OK".to_string()))
+                .await;
+            return Ok(());
+        }
         // `AUTH` changes this connection's login flag, which lives on the
         // task rather than in the shared server, so it is handled before
         // dispatch. Inside `MULTI` it falls through and is queued; `EXEC`
@@ -981,26 +989,49 @@ fn wrong_type() -> Value {
     Value::Error("WRONGTYPE Operation against a key holding the wrong kind of value".to_string())
 }
 
-/// `AUTH password` — log this connection in when `--requirepass` is set.
+/// `AUTH <password>` or `AUTH <username> <password>` — log this connection in
+/// when `--requirepass` is set.
 ///
-/// A matching password sets `authenticated`. A mismatch clears it, so a
-/// connection that was already logged in is logged out again (Redis does the
-/// same). With no password configured the command is an error and the flag
-/// is left alone. A wrong number of arguments is also left alone: the
-/// password was never checked.
+/// The only username is `default` (the one-argument form implies it). Any
+/// other username is `WRONGPASS`, and the password is still compared so the
+/// reply does not skip the check. A match sets `authenticated`. A mismatch
+/// clears it, so a connection that was already logged in is logged out again.
+/// With no password configured the command is an error and the flag is left
+/// alone. A wrong number of arguments is also left alone: the password was
+/// never checked.
 fn authenticate(value: &Value, requirepass: Option<&str>, authenticated: &mut bool) -> Value {
     let args = command_args(value);
-    if args.len() != 1 {
+    if args.is_empty() || args.len() > 2 {
         return wrong_args("auth");
     }
+    let (username, password) = if args.len() == 1 {
+        (
+            "default".to_string(),
+            match unpack_bulk_str(&args[0]) {
+                Ok(password) => password,
+                Err(e) => return Value::Error(format!("ERR {e}")),
+            },
+        )
+    } else {
+        let username = match unpack_bulk_str(&args[0]) {
+            Ok(username) => username,
+            Err(e) => return Value::Error(format!("ERR {e}")),
+        };
+        let password = match unpack_bulk_str(&args[1]) {
+            Ok(password) => password,
+            Err(e) => return Value::Error(format!("ERR {e}")),
+        };
+        (username, password)
+    };
     let Some(expected) = requirepass else {
         return Value::Error("ERR AUTH called without any password configured".to_string());
     };
-    let given = match unpack_bulk_str(&args[0]) {
-        Ok(password) => password,
-        Err(e) => return Value::Error(format!("ERR {e}")),
-    };
-    if given == expected {
+    // Both comparisons run to completion. `subtle` compares the bytes in
+    // constant time when the lengths match, and reports a mismatch when they
+    // do not.
+    let user_ok = subtle::ConstantTimeEq::ct_eq(username.as_bytes(), b"default".as_slice()).into();
+    let pass_ok = subtle::ConstantTimeEq::ct_eq(password.as_bytes(), expected.as_bytes()).into();
+    if user_ok && pass_ok {
         *authenticated = true;
         Value::SimpleString("OK".to_string())
     } else {
@@ -1374,6 +1405,33 @@ mod tests {
     fn config_reports_a_missing_requirepass_value() {
         let err = Config::parse(argv(&["--requirepass"])).unwrap_err();
         assert_eq!(err, "missing value for --requirepass option");
+    }
+
+    fn auth_frame(parts: &[&str]) -> Value {
+        Value::Array(parts.iter().map(|part| bulk(part)).collect())
+    }
+
+    #[test]
+    fn auth_accepts_the_default_user_and_rejects_any_other() {
+        let mut authed = false;
+        assert_eq!(
+            authenticate(
+                &auth_frame(&["AUTH", "default", "secret"]),
+                Some("secret"),
+                &mut authed
+            ),
+            Value::SimpleString("OK".to_string())
+        );
+        assert!(authed);
+        // A different username fails even when the password bytes match, and
+        // clears a login that was already established.
+        let reply = authenticate(
+            &auth_frame(&["AUTH", "alice", "secret"]),
+            Some("secret"),
+            &mut authed,
+        );
+        assert!(matches!(reply, Value::Error(text) if text.starts_with("WRONGPASS")));
+        assert!(!authed);
     }
 
     #[test]

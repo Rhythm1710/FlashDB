@@ -50,11 +50,14 @@ value prints a message and exits non-zero rather than starting.
 ## Authentication
 
 `--requirepass <password>` makes the server refuse every command until that
-connection sends `AUTH <password>`. Until then the reply is
-`-NOAUTH Authentication required.` `AUTH` with the wrong password replies
+connection sends `AUTH <password>` or `AUTH default <password>`. Any other
+username is `WRONGPASS`. Until then the reply is
+`-NOAUTH Authentication required.` `QUIT` is the exception: it closes the
+connection without logging in. `AUTH` with the wrong password replies
 `-WRONGPASS invalid username-password pair or user is disabled.` and leaves
 the connection unauthenticated, including a connection that had already
-logged in. Authentication is per connection: one client logging in does not
+logged in. The password compare does not stop at the first differing byte.
+Authentication is per connection: one client logging in does not
 unlock any other. With no `--requirepass`, `AUTH` replies with an error and
 every other command runs as usual.
 
@@ -65,7 +68,8 @@ wired up.
 ## Implemented commands
 
 - `PING`
-- `AUTH password`
+- `AUTH [username] password`
+- `QUIT`
 - `ECHO`
 - `SET key value [EX seconds | PX milliseconds]`
 - `GET`

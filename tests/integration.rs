@@ -1663,3 +1663,48 @@ async fn auth_without_requirepass_is_an_error_and_commands_still_run() {
     send(&mut client, b"*1\r\n$4\r\nPING\r\n").await;
     expect_reply(&mut client, "+PONG\r\n").await;
 }
+
+#[tokio::test]
+async fn auth_default_user_succeeds_and_other_usernames_do_not() {
+    let addr = start_server_with_password(Some("secret")).await;
+    let mut client = connect(addr).await;
+
+    // AUTH default <password> is the two-argument form of the same login.
+    send(
+        &mut client,
+        b"*3\r\n$4\r\nAUTH\r\n$7\r\ndefault\r\n$6\r\nsecret\r\n",
+    )
+    .await;
+    expect_reply(&mut client, "+OK\r\n").await;
+    send(&mut client, b"*1\r\n$4\r\nPING\r\n").await;
+    expect_reply(&mut client, "+PONG\r\n").await;
+
+    // A correct password for a username other than default is still WRONGPASS
+    // and logs the connection out.
+    send(
+        &mut client,
+        b"*3\r\n$4\r\nAUTH\r\n$5\r\nalice\r\n$6\r\nsecret\r\n",
+    )
+    .await;
+    expect_reply(
+        &mut client,
+        "-WRONGPASS invalid username-password pair or user is disabled.\r\n",
+    )
+    .await;
+    send(&mut client, b"*1\r\n$4\r\nPING\r\n").await;
+    expect_reply(&mut client, "-NOAUTH Authentication required.\r\n").await;
+}
+
+#[tokio::test]
+async fn quit_is_allowed_before_auth_and_closes_the_connection() {
+    let addr = start_server_with_password(Some("secret")).await;
+    let mut client = connect(addr).await;
+    send(&mut client, b"*1\r\n$4\r\nQUIT\r\n").await;
+    expect_reply(&mut client, "+OK\r\n").await;
+    let mut chunk = [0u8; 8];
+    let n = tokio::time::timeout(Duration::from_secs(2), client.read(&mut chunk))
+        .await
+        .expect("timed out waiting for the connection to close")
+        .expect("read failed");
+    assert_eq!(n, 0, "QUIT should close the connection");
+}
