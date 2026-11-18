@@ -18,7 +18,6 @@ use crate::{
     command_args, command_name, expire_if_due, now_unix_ms, stream, unpack_bulk_str, wrong_args,
     wrong_type, Entry, Server, Store, StoredValue,
 };
-use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use stream::Stream;
 use tokio::time::timeout;
@@ -474,7 +473,7 @@ fn parse_xread(args: &[Value]) -> Result<XReadRequest, String> {
 /// wrong-typed key aborts the whole read with `WRONGTYPE`. Needs `&mut` only to
 /// run passive expiry before reading.
 fn resolve_after_ids(
-    store: &mut HashMap<String, Entry>,
+    store: &mut crate::Keyspace,
     req: &XReadRequest,
 ) -> Result<Vec<stream::StreamId>, Value> {
     let now = Instant::now();
@@ -503,7 +502,7 @@ fn resolve_after_ids(
 /// pair. Returns the nil array (`Value::NullArray`) when nothing is new, exactly
 /// as Redis does. Read-only — the caller holds the lock.
 fn xread_collect(
-    store: &HashMap<String, Entry>,
+    store: &crate::Keyspace,
     req: &XReadRequest,
     afters: &[stream::StreamId],
 ) -> Value {
@@ -626,11 +625,9 @@ pub(crate) fn as_blocking_xread(value: &Value) -> Option<XReadRequest> {
 mod tests {
     use super::*;
     use crate::{get, process_command, set, type_cmd};
-    use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
 
     fn store() -> Store {
-        Arc::new(Mutex::new(HashMap::new()))
+        crate::empty_store()
     }
 
     fn bulk(s: &str) -> Value {
