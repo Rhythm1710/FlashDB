@@ -124,12 +124,16 @@ input:focus-visible {
 }
 
 form {
+  position: sticky;
+  bottom: 0;
+  z-index: 2;
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
   padding: 10px 12px 14px;
   border-top: 1px solid var(--line);
   background: var(--bg);
+  transform: translateY(calc(-1 * var(--keyboard-inset, 0px)));
 }
 
 input {

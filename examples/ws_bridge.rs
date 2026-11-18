@@ -19,53 +19,69 @@ use tokio::net::{TcpListener, TcpStream};
 
 const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const HELP: &str = "\
-Usage: ws_bridge [--listen ADDR] [--flashdb ADDR] [--dir PATH]
+Usage: ws_bridge [--listen ADDR] [--flashdb ADDR] [--dir PATH] [--allow-origin ORIGIN]
 
-  --listen ADDR    HTTP and WebSocket bind address (default 127.0.0.1:8080)
-  --flashdb ADDR   RESP database to dial (default 127.0.0.1:6379)
-  --dir PATH       static playground directory (default <crate>/playground)
+  --listen ADDR         HTTP and WebSocket bind address (default 127.0.0.1:8080)
+  --flashdb ADDR        RESP database to dial (default 127.0.0.1:6379)
+  --dir PATH            static playground directory (default <crate>/playground)
+  --allow-origin ORIGIN extra browser Origin allowed to open /ws (repeatable)
 ";
+
+struct BridgeConfig {
+    listen: std::net::SocketAddr,
+    flashdb: String,
+    root: PathBuf,
+    allow_origins: Vec<String>,
+}
 
 struct Request {
     path: String,
     websocket_key: Option<String>,
+    host: Option<String>,
+    origin: Option<String>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let (listen, flashdb, root) = match parse_args() {
+    let config = match parse_args() {
         Ok(config) => config,
         Err(msg) => {
             eprintln!("ws_bridge: {msg}");
             std::process::exit(1);
         }
     };
-    if !root.join("index.html").is_file() {
+    if !config.root.join("index.html").is_file() {
         eprintln!(
             "ws_bridge: playground files not found in {}",
-            root.display()
+            config.root.display()
         );
         std::process::exit(1);
     }
-    let listener = TcpListener::bind(listen).await?;
-    println!("FlashDB playground at http://{listen} (database {flashdb})");
-    let root = Arc::new(root);
+    let listener = TcpListener::bind(config.listen).await?;
+    println!(
+        "FlashDB playground at http://{} (database {})",
+        config.listen, config.flashdb
+    );
+    let root = Arc::new(config.root);
+    let allow_origins = Arc::new(config.allow_origins);
     loop {
         let (stream, _) = listener.accept().await?;
-        let flashdb = flashdb.clone();
+        let flashdb = config.flashdb.clone();
         let root = Arc::clone(&root);
+        let allow_origins = Arc::clone(&allow_origins);
         tokio::spawn(async move {
-            if let Err(e) = handle_client(stream, &flashdb, &root).await {
+            if let Err(e) = handle_client(stream, &flashdb, &root, &allow_origins).await {
                 eprintln!("playground client error: {e:#}");
             }
         });
     }
 }
 
-fn parse_args() -> std::result::Result<(std::net::SocketAddr, String, PathBuf), String> {
+fn parse_args() -> std::result::Result<BridgeConfig, String> {
     let mut listen = "127.0.0.1:8080".to_string();
     let mut flashdb = "127.0.0.1:6379".to_string();
     let mut dir = None;
+    let mut allow_origins = Vec::new();
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
         let mut value = || {
@@ -76,6 +92,7 @@ fn parse_args() -> std::result::Result<(std::net::SocketAddr, String, PathBuf), 
             "--listen" => listen = value()?,
             "--flashdb" => flashdb = value()?,
             "--dir" => dir = Some(value()?),
+            "--allow-origin" => allow_origins.push(value()?),
             "-h" | "--help" => {
                 print!("{HELP}");
                 std::process::exit(0);
@@ -83,26 +100,76 @@ fn parse_args() -> std::result::Result<(std::net::SocketAddr, String, PathBuf), 
             other => return Err(format!("unknown argument '{other}'")),
         }
     }
-    let addr = listen
+    let listen = listen
         .parse()
         .map_err(|_| format!("invalid listen address '{listen}'"))?;
     let root = match dir {
         Some(path) => PathBuf::from(path),
         None => PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("playground"),
     };
-    Ok((addr, flashdb, root))
+    Ok(BridgeConfig {
+        listen,
+        flashdb,
+        root,
+        allow_origins,
+    })
 }
 
-async fn handle_client(mut stream: TcpStream, flashdb: &str, root: &Path) -> Result<()> {
+async fn handle_client(
+    mut stream: TcpStream,
+    flashdb: &str,
+    root: &Path,
+    allow_origins: &[String],
+) -> Result<()> {
     let head = read_headers(&mut stream).await?;
     let request = parse_request(&head)?;
     if request.path == "/ws" {
+        if !origin_allowed(
+            request.origin.as_deref(),
+            request.host.as_deref(),
+            allow_origins,
+        ) {
+            return write_http(
+                &mut stream,
+                403,
+                "Forbidden",
+                "text/plain; charset=utf-8",
+                b"origin is not allowed",
+            )
+            .await;
+        }
         let key = request
             .websocket_key
             .context("WebSocket upgrade is missing Sec-WebSocket-Key")?;
         return websocket_session(&mut stream, &key, flashdb).await;
     }
     serve_static(&mut stream, root, &request.path).await
+}
+
+/// Browsers send `Origin` on a WebSocket handshake. The default is the page's
+/// own origin: `Origin` must be `http(s)://` plus the request `Host`. A
+/// missing `Origin` is allowed so non-browser clients can still connect.
+/// `--allow-origin` adds further exact origins.
+fn origin_allowed(origin: Option<&str>, host: Option<&str>, allow_origins: &[String]) -> bool {
+    let Some(origin) = origin.map(str::trim).filter(|value| !value.is_empty()) else {
+        return true;
+    };
+    if allow_origins.iter().any(|allowed| {
+        allowed
+            .trim()
+            .trim_end_matches('/')
+            .eq_ignore_ascii_case(origin.trim().trim_end_matches('/'))
+    }) {
+        return true;
+    }
+    let Some(host) = host.map(str::trim).filter(|value| !value.is_empty()) else {
+        return false;
+    };
+    let Some((_, rest)) = origin.split_once("://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    authority.eq_ignore_ascii_case(host)
 }
 
 async fn read_headers(stream: &mut TcpStream) -> Result<String> {
@@ -139,17 +206,26 @@ fn parse_request(head: &str) -> Result<Request> {
     }
     let path = raw_path.split('?').next().unwrap_or("/").to_string();
     let mut websocket_key = None;
+    let mut host = None;
+    let mut origin = None;
     for line in lines {
         let Some((name, value)) = line.split_once(':') else {
             continue;
         };
+        let value = value.trim().to_string();
         if name.eq_ignore_ascii_case("Sec-WebSocket-Key") {
-            websocket_key = Some(value.trim().to_string());
+            websocket_key = Some(value);
+        } else if name.eq_ignore_ascii_case("Host") {
+            host = Some(value);
+        } else if name.eq_ignore_ascii_case("Origin") {
+            origin = Some(value);
         }
     }
     Ok(Request {
         path,
         websocket_key,
+        host,
+        origin,
     })
 }
 
@@ -590,6 +666,34 @@ mod tests {
             vec!["SET", "q", "say \"hi\""]
         );
         assert!(split_command("SET greeting \"oops").is_err());
+    }
+
+    #[test]
+    fn websocket_origin_defaults_to_the_request_host() {
+        let allow = Vec::new();
+        assert!(origin_allowed(None, Some("127.0.0.1:8080"), &allow));
+        assert!(origin_allowed(
+            Some("http://127.0.0.1:8080"),
+            Some("127.0.0.1:8080"),
+            &allow
+        ));
+        assert!(!origin_allowed(
+            Some("http://evil.example"),
+            Some("127.0.0.1:8080"),
+            &allow
+        ));
+        assert!(!origin_allowed(Some("http://127.0.0.1:8080"), None, &allow));
+        let allow = vec!["https://phone.example".to_string()];
+        assert!(origin_allowed(
+            Some("https://phone.example"),
+            Some("192.168.1.20:8080"),
+            &allow
+        ));
+        assert!(origin_allowed(
+            Some("https://phone.example/"),
+            Some("192.168.1.20:8080"),
+            &allow
+        ));
     }
 
     fn hex(bytes: &[u8]) -> String {

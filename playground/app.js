@@ -113,5 +113,20 @@ if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("/sw.js").catch(() => {});
 }
 
+// iOS keeps the layout viewport full-height when the keyboard opens, so a
+// bottom composer sits underneath it. visualViewport is the area still
+// visible; shift the composer up by the covered strip.
+function liftComposer() {
+  const viewport = window.visualViewport;
+  if (!viewport) return;
+  const covered = Math.max(0, window.innerHeight - viewport.offsetTop - viewport.height);
+  document.documentElement.style.setProperty("--keyboard-inset", `${covered}px`);
+}
+if (window.visualViewport) {
+  window.visualViewport.addEventListener("resize", liftComposer);
+  window.visualViewport.addEventListener("scroll", liftComposer);
+  liftComposer();
+}
+
 render();
 connect();

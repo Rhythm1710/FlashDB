@@ -470,8 +470,17 @@ cargo run --example ws_bridge -- --listen 127.0.0.1:8080 --flashdb 127.0.0.1:637
 ```
 
 The bridge is a development proxy. Leave it on localhost unless you trust the
-network it is bound to. Subscribe-mode commands (`SUBSCRIBE`) are a poor fit
-for the one-reply-per-command bridge; ordinary request/response commands are
+network it is bound to. To open the playground from a phone on the same LAN,
+bind every interface and browse to this machine's LAN address:
+
+```sh
+cargo run --example ws_bridge -- --listen 0.0.0.0:8080
+```
+
+Then on the phone open `http://<host-LAN-IP>:8080`. `/ws` accepts the page's
+own origin by default. Pass `--allow-origin https://example` (repeatable) to
+allow another browser origin. Subscribe-mode commands (`SUBSCRIBE`) are a poor
+fit for the one-reply-per-command bridge; ordinary request/response commands are
 what the page is for.
 
 ## Continuous integration
