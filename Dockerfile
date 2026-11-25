@@ -15,6 +15,5 @@ COPY --from=build /src/target/release/examples/ws_bridge /usr/local/bin/ws_bridg
 COPY playground /opt/flashdb/playground
 USER flashdb
 ENV FLASHDB_DATA_DIR=/tmp/flashdb
-ENV FLASHDB_TRUST_PROXY=1
 EXPOSE 8080
 CMD ["ws_bridge", "--public", "--dir", "/opt/flashdb/playground"]

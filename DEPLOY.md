@@ -19,7 +19,7 @@ The container listens on `$PORT` and answers `GET /healthz`. Set the Vercel orig
 | `FLASHDB_DATA_DIR` | no | Ephemeral directory for per-session files. Default `/tmp/flashdb`. Also `--data-dir`, or `FLASHDB_DIR` / `DATA_DIR`. |
 | `FLASHDB_MAX_SESSIONS` | no | Concurrent sessions across all clients. Default `32`. |
 | `FLASHDB_MAX_SESSIONS_PER_CLIENT` | no | Concurrent sessions from one client address. Default `4`. |
-| `FLASHDB_TRUST_PROXY` | on Railway | `1`, `true`, or `yes` reads the visitor from `X-Real-IP`, then the right-most `X-Forwarded-For` entry. Anything else, including unset, uses the TCP peer. A missing or unparseable header also uses the peer. The container image sets this to `1` because Railway's edge is the peer; without it the per-client cap would apply to the proxy and the demo would stop at about 4 sessions. |
+| `FLASHDB_TRUST_PROXY` | set on the Railway service | `1`, `true`, or `yes` reads the visitor from `X-Real-IP`, then the right-most `X-Forwarded-For` entry. Anything else, including unset, uses the TCP peer. A missing or unparseable header also uses the peer. Set `FLASHDB_TRUST_PROXY=1` in the Railway dashboard or with the CLI. Do not bake it into the image: a direct deploy would then trust a spoofed `X-Real-IP`. Without it on Railway, the per-client cap applies to the edge proxy and the demo stops at about 4 sessions. |
 | `FLASHDB_MAX_MEMORY` | no | Payload bytes per session. Default `1048576`. |
 | `FLASHDB_MAX_KEY_BYTES` | no | Default `1024`. |
 | `FLASHDB_MAX_VALUE_BYTES` | no | Default `8192`. |
