@@ -12,19 +12,41 @@
 
 use anyhow::{anyhow, Context, Result};
 use flashdb::resp::{self, Value};
+use flashdb::Server;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+#[path = "bridge_support/public_mode.rs"]
+mod public_mode;
+
+static SESSION_IDS: AtomicU64 = AtomicU64::new(1);
+
 const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const HELP: &str = "\
-Usage: ws_bridge [--listen ADDR] [--flashdb ADDR] [--dir PATH] [--allow-origin ORIGIN]
+Usage: ws_bridge [--public] [--listen ADDR] [--flashdb ADDR] [--dir PATH]
+                 [--data-dir PATH] [--allow-origin ORIGIN]
+                 [--max-sessions N] [--max-memory BYTES]
+                 [--max-key-bytes N] [--max-value-bytes N]
+                 [--max-commands-per-sec N] [--idle-secs N]
 
-  --listen ADDR         HTTP and WebSocket bind address (default 127.0.0.1:8080)
-  --flashdb ADDR        RESP database to dial (default 127.0.0.1:6379)
-  --dir PATH            static playground directory (default <crate>/playground)
-  --allow-origin ORIGIN extra browser Origin allowed to open /ws (repeatable)
+  --public                  one isolated FlashDB per browser session
+  --listen ADDR             HTTP bind address (default 127.0.0.1:8080, or 0.0.0.0:$PORT)
+  --flashdb ADDR            RESP database to dial when not --public (default 127.0.0.1:6379)
+  --dir PATH                static playground directory (default <crate>/playground)
+  --data-dir PATH           ephemeral session directory in --public (env FLASHDB_DATA_DIR)
+  --allow-origin ORIGIN     browser Origin allowed to open /ws (repeatable; required with --public)
+  --max-sessions N          concurrent public sessions (default 32)
+  --max-sessions-per-client N
+                            sessions from one client address (default 4)
+  --max-memory BYTES        payload bytes per session (default 1048576)
+  --max-key-bytes N         max key length (default 1024)
+  --max-value-bytes N       max value length (default 8192)
+  --max-commands-per-sec N  per session (default 30)
+  --idle-secs N             close a quiet session (default 120)
 ";
 
 struct BridgeConfig {
@@ -32,6 +54,11 @@ struct BridgeConfig {
     flashdb: String,
     root: PathBuf,
     allow_origins: Vec<String>,
+    public: bool,
+    data_dir: PathBuf,
+    limits: public_mode::Limits,
+    gate: Arc<public_mode::Gate>,
+    trust_proxy: bool,
 }
 
 struct Request {
@@ -39,6 +66,8 @@ struct Request {
     websocket_key: Option<String>,
     host: Option<String>,
     origin: Option<String>,
+    real_ip: Option<String>,
+    forwarded_for: Option<String>,
 }
 
 #[tokio::main]
@@ -57,31 +86,99 @@ async fn main() -> Result<()> {
         );
         std::process::exit(1);
     }
+    if config.public && config.allow_origins.is_empty() {
+        eprintln!(
+            "ws_bridge: --public requires at least one --allow-origin (or FLASHDB_ALLOW_ORIGIN)"
+        );
+        std::process::exit(1);
+    }
+    if config.public {
+        if let Err(e) = std::fs::create_dir_all(&config.data_dir) {
+            eprintln!(
+                "ws_bridge: cannot create data dir {}: {e}",
+                config.data_dir.display()
+            );
+            std::process::exit(1);
+        }
+    }
     let listener = TcpListener::bind(config.listen).await?;
-    println!(
-        "FlashDB playground at http://{} (database {})",
-        config.listen, config.flashdb
-    );
-    let root = Arc::new(config.root);
-    let allow_origins = Arc::new(config.allow_origins);
+    if config.public {
+        println!(
+            "FlashDB public playground at http://{} (data {})",
+            config.listen,
+            config.data_dir.display()
+        );
+    } else {
+        println!(
+            "FlashDB playground at http://{} (database {})",
+            config.listen, config.flashdb
+        );
+    }
+    let config = Arc::new(config);
     loop {
-        let (stream, _) = listener.accept().await?;
-        let flashdb = config.flashdb.clone();
-        let root = Arc::clone(&root);
-        let allow_origins = Arc::clone(&allow_origins);
+        let (stream, peer) = listener.accept().await?;
+        let config = Arc::clone(&config);
         tokio::spawn(async move {
-            if let Err(e) = handle_client(stream, &flashdb, &root, &allow_origins).await {
+            if let Err(e) = handle_client(stream, peer.ip(), &config).await {
                 eprintln!("playground client error: {e:#}");
             }
         });
     }
 }
 
+fn env_enabled(key: &str) -> bool {
+    match env_nonempty(key).as_deref() {
+        Some("1") => true,
+        Some(value) if value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes") => {
+            true
+        }
+        _ => false,
+    }
+}
+
+fn env_nonempty(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|value| !value.is_empty())
+}
+
+fn env_usize(key: &str, default: usize) -> std::result::Result<usize, String> {
+    match env_nonempty(key) {
+        Some(raw) => raw.parse().map_err(|_| format!("invalid {key} '{raw}'")),
+        None => Ok(default),
+    }
+}
+
+fn origins_from_env() -> Vec<String> {
+    let mut out = Vec::new();
+    for key in ["FLASHDB_ALLOW_ORIGIN", "FLASHDB_ALLOW_ORIGINS"] {
+        if let Some(raw) = env_nonempty(key) {
+            out.extend(
+                raw.split(',')
+                    .map(str::trim)
+                    .filter(|part| !part.is_empty())
+                    .map(str::to_string),
+            );
+        }
+    }
+    out
+}
+
 fn parse_args() -> std::result::Result<BridgeConfig, String> {
-    let mut listen = "127.0.0.1:8080".to_string();
+    let mut listen = None;
     let mut flashdb = "127.0.0.1:6379".to_string();
     let mut dir = None;
-    let mut allow_origins = Vec::new();
+    let mut data_dir = env_nonempty("FLASHDB_DATA_DIR")
+        .or_else(|| env_nonempty("FLASHDB_DIR"))
+        .or_else(|| env_nonempty("DATA_DIR"));
+    let mut allow_origins = origins_from_env();
+    let mut public = env_enabled("FLASHDB_PUBLIC");
+    let trust_proxy = env_enabled("FLASHDB_TRUST_PROXY");
+    let mut max_sessions = None;
+    let mut max_per_client = None;
+    let mut max_memory = None;
+    let mut max_key = None;
+    let mut max_value = None;
+    let mut max_per_sec = None;
+    let mut idle_secs = None;
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
         let mut value = || {
@@ -89,10 +186,19 @@ fn parse_args() -> std::result::Result<BridgeConfig, String> {
                 .ok_or_else(|| format!("missing value for {flag}"))
         };
         match flag.as_str() {
-            "--listen" => listen = value()?,
+            "--public" => public = true,
+            "--listen" => listen = Some(value()?),
             "--flashdb" => flashdb = value()?,
             "--dir" => dir = Some(value()?),
+            "--data-dir" => data_dir = Some(value()?),
             "--allow-origin" => allow_origins.push(value()?),
+            "--max-sessions" => max_sessions = Some(value()?),
+            "--max-sessions-per-client" => max_per_client = Some(value()?),
+            "--max-memory" => max_memory = Some(value()?),
+            "--max-key-bytes" => max_key = Some(value()?),
+            "--max-value-bytes" => max_value = Some(value()?),
+            "--max-commands-per-sec" => max_per_sec = Some(value()?),
+            "--idle-secs" => idle_secs = Some(value()?),
             "-h" | "--help" => {
                 print!("{HELP}");
                 std::process::exit(0);
@@ -100,6 +206,13 @@ fn parse_args() -> std::result::Result<BridgeConfig, String> {
             other => return Err(format!("unknown argument '{other}'")),
         }
     }
+    let listen = match listen {
+        Some(raw) => raw,
+        None => match env_nonempty("PORT") {
+            Some(port) => format!("0.0.0.0:{port}"),
+            None => "127.0.0.1:8080".to_string(),
+        },
+    };
     let listen = listen
         .parse()
         .map_err(|_| format!("invalid listen address '{listen}'"))?;
@@ -107,28 +220,84 @@ fn parse_args() -> std::result::Result<BridgeConfig, String> {
         Some(path) => PathBuf::from(path),
         None => PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("playground"),
     };
+    let defaults = public_mode::Limits::default();
+    let parse_flag = |raw: Option<String>,
+                      env_key: &str,
+                      default: usize|
+     -> std::result::Result<usize, String> {
+        match raw {
+            Some(raw) => raw
+                .parse()
+                .map_err(|_| format!("invalid {env_key} '{raw}'")),
+            None => env_usize(env_key, default),
+        }
+    };
+    let limits = public_mode::Limits {
+        max_sessions: parse_flag(max_sessions, "FLASHDB_MAX_SESSIONS", defaults.max_sessions)?,
+        max_per_client: parse_flag(
+            max_per_client,
+            "FLASHDB_MAX_SESSIONS_PER_CLIENT",
+            defaults.max_per_client,
+        )?,
+        max_memory: parse_flag(max_memory, "FLASHDB_MAX_MEMORY", defaults.max_memory)?,
+        max_key: parse_flag(max_key, "FLASHDB_MAX_KEY_BYTES", defaults.max_key)?,
+        max_value: parse_flag(max_value, "FLASHDB_MAX_VALUE_BYTES", defaults.max_value)?,
+        max_per_sec: parse_flag(
+            max_per_sec,
+            "FLASHDB_MAX_COMMANDS_PER_SEC",
+            defaults.max_per_sec as usize,
+        )? as u32,
+        idle: std::time::Duration::from_secs(parse_flag(
+            idle_secs,
+            "FLASHDB_IDLE_SECS",
+            defaults.idle.as_secs() as usize,
+        )? as u64),
+    };
+    if limits.max_sessions == 0
+        || limits.max_per_client == 0
+        || limits.max_memory == 0
+        || limits.max_key == 0
+        || limits.max_value == 0
+        || limits.max_per_sec == 0
+        || limits.idle.is_zero()
+    {
+        return Err("session limits must be greater than zero".to_string());
+    }
+    let gate = public_mode::Gate::new(limits.max_sessions, limits.max_per_client);
     Ok(BridgeConfig {
         listen,
         flashdb,
         root,
         allow_origins,
+        public,
+        data_dir: PathBuf::from(data_dir.unwrap_or_else(|| "/tmp/flashdb".to_string())),
+        limits,
+        gate,
+        trust_proxy,
     })
 }
 
 async fn handle_client(
     mut stream: TcpStream,
-    flashdb: &str,
-    root: &Path,
-    allow_origins: &[String],
+    client: std::net::IpAddr,
+    config: &BridgeConfig,
 ) -> Result<()> {
     let head = read_headers(&mut stream).await?;
     let request = parse_request(&head)?;
+    if request.path == "/healthz" {
+        return write_http(&mut stream, 200, "OK", "text/plain; charset=utf-8", b"ok\n").await;
+    }
     if request.path == "/ws" {
-        if !origin_allowed(
-            request.origin.as_deref(),
-            request.host.as_deref(),
-            allow_origins,
-        ) {
+        let allowed = if config.public {
+            public_mode::origin_allowed(request.origin.as_deref(), &config.allow_origins)
+        } else {
+            origin_allowed(
+                request.origin.as_deref(),
+                request.host.as_deref(),
+                &config.allow_origins,
+            )
+        };
+        if !allowed {
             return write_http(
                 &mut stream,
                 403,
@@ -141,9 +310,111 @@ async fn handle_client(
         let key = request
             .websocket_key
             .context("WebSocket upgrade is missing Sec-WebSocket-Key")?;
-        return websocket_session(&mut stream, &key, flashdb).await;
+        let client = public_mode::client_ip(
+            client,
+            config.trust_proxy,
+            request.real_ip.as_deref(),
+            request.forwarded_for.as_deref(),
+        );
+        if config.public {
+            return public_session(&mut stream, &key, client, config).await;
+        }
+        return websocket_session(&mut stream, &key, &config.flashdb).await;
     }
-    serve_static(&mut stream, root, &request.path).await
+    serve_static(&mut stream, &config.root, &request.path).await
+}
+
+async fn public_session(
+    stream: &mut TcpStream,
+    key: &str,
+    client: std::net::IpAddr,
+    config: &BridgeConfig,
+) -> Result<()> {
+    let _permit = match config.gate.try_enter(client) {
+        public_mode::Admit::Admitted(permit) => permit,
+        public_mode::Admit::TooManyForClient => {
+            return write_http(
+                stream,
+                503,
+                "Service Unavailable",
+                "text/plain; charset=utf-8",
+                b"too many sessions for this client",
+            )
+            .await
+        }
+        public_mode::Admit::TooManySessions => {
+            return write_http(
+                stream,
+                503,
+                "Service Unavailable",
+                "text/plain; charset=utf-8",
+                b"too many sessions",
+            )
+            .await
+        }
+    };
+    let id = SESSION_IDS.fetch_add(1, Ordering::Relaxed);
+    let session_dir = public_mode::SessionDir::create(&config.data_dir, id).with_context(|| {
+        format!(
+            "creating a session directory in {}",
+            config.data_dir.display()
+        )
+    })?;
+    let server = Server::isolated(session_dir.path().join("dump.rdb"));
+    let mut rate = public_mode::RateWindow::new(config.limits.max_per_sec);
+    let response = format!(
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n",
+        ws_accept(key)
+    );
+    stream.write_all(response.as_bytes()).await?;
+    stream.flush().await?;
+    loop {
+        let frame =
+            tokio::time::timeout(config.limits.idle, read_ws_text(stream, WS_MAX_MESSAGE)).await;
+        let line = match frame {
+            Err(_) => {
+                let _ = write_ws_text(stream, "(error) ERR idle timeout").await;
+                break;
+            }
+            Ok(Err(e)) => {
+                let _ = write_frame(stream, 0x8, &[]).await;
+                return Err(e);
+            }
+            Ok(Ok(None)) => break,
+            Ok(Ok(Some(line))) => {
+                if public_mode::command_line_too_long(&line, &config.limits) {
+                    write_ws_text(stream, "(error) ERR message is too large").await?;
+                    continue;
+                }
+                line
+            }
+        };
+        let parts = match split_command(&line) {
+            Ok(parts) => parts,
+            Err(e) => {
+                write_ws_text(stream, &format!("(error) {e}")).await?;
+                continue;
+            }
+        };
+        if parts.is_empty() {
+            continue;
+        }
+        let reply = match public_mode::run_command(
+            &server,
+            &mut rate,
+            &config.limits,
+            &parts,
+            Instant::now(),
+        ) {
+            Ok(value) => format_reply(&value),
+            Err(e) => format!("(error) {e}"),
+        };
+        if !reply.is_empty() {
+            write_ws_text(stream, &reply).await?;
+        }
+    }
+    drop(session_dir);
+    Ok(())
 }
 
 /// Browsers send `Origin` on a WebSocket handshake. The default is the page's
@@ -208,6 +479,8 @@ fn parse_request(head: &str) -> Result<Request> {
     let mut websocket_key = None;
     let mut host = None;
     let mut origin = None;
+    let mut real_ip = None;
+    let mut forwarded_for = None;
     for line in lines {
         let Some((name, value)) = line.split_once(':') else {
             continue;
@@ -219,6 +492,10 @@ fn parse_request(head: &str) -> Result<Request> {
             host = Some(value);
         } else if name.eq_ignore_ascii_case("Origin") {
             origin = Some(value);
+        } else if name.eq_ignore_ascii_case("X-Real-IP") {
+            real_ip = Some(value);
+        } else if name.eq_ignore_ascii_case("X-Forwarded-For") {
+            forwarded_for = Some(value);
         }
     }
     Ok(Request {
@@ -226,6 +503,8 @@ fn parse_request(head: &str) -> Result<Request> {
         websocket_key,
         host,
         origin,
+        real_ip,
+        forwarded_for,
     })
 }
 
@@ -262,6 +541,7 @@ fn static_file(path: &str) -> Option<(&'static str, &'static str)> {
         "/style.css" => Some(("style.css", "text/css; charset=utf-8")),
         "/manifest.webmanifest" => Some(("manifest.webmanifest", "application/manifest+json")),
         "/sw.js" => Some(("sw.js", "text/javascript; charset=utf-8")),
+        "/config.js" => Some(("config.js", "text/javascript; charset=utf-8")),
         "/icon-192.png" => Some(("icon-192.png", "image/png")),
         "/icon-512.png" => Some(("icon-512.png", "image/png")),
         _ => None,
@@ -296,7 +576,7 @@ async fn websocket_session(stream: &mut TcpStream, key: &str, flashdb: &str) -> 
     let mut db = None;
     let mut buf = Vec::new();
     loop {
-        let Some(line) = read_ws_text(stream).await? else {
+        let Some(line) = read_ws_text(stream, WS_MAX_MESSAGE).await? else {
             break;
         };
         let reply = match run_command(&mut db, &mut buf, flashdb, &line).await {
@@ -442,17 +722,27 @@ fn format_reply(value: &Value) -> String {
     rec(value, 0)
 }
 
-async fn read_ws_text(stream: &mut TcpStream) -> Result<Option<String>> {
+const WS_MAX_MESSAGE: usize = 1_000_000;
+
+async fn read_ws_text(stream: &mut TcpStream, max_message: usize) -> Result<Option<String>> {
     let mut message = Vec::new();
     let mut started = false;
     loop {
-        let (fin, opcode, payload) = read_frame(stream).await?;
+        let (fin, opcode, payload) = read_frame(stream, max_message).await?;
         match opcode {
             0x1 => {
+                if payload.len() > max_message {
+                    anyhow::bail!("websocket message is too large");
+                }
                 message = payload;
                 started = true;
             }
-            0x0 if started => message.extend_from_slice(&payload),
+            0x0 if started => {
+                if message.len().saturating_add(payload.len()) > max_message {
+                    anyhow::bail!("websocket message is too large");
+                }
+                message.extend_from_slice(&payload);
+            }
             0x8 => {
                 let _ = write_frame(stream, 0x8, &[]).await;
                 return Ok(None);
@@ -472,7 +762,7 @@ async fn read_ws_text(stream: &mut TcpStream) -> Result<Option<String>> {
     }
 }
 
-async fn read_frame(stream: &mut TcpStream) -> Result<(bool, u8, Vec<u8>)> {
+async fn read_frame(stream: &mut TcpStream, max_len: usize) -> Result<(bool, u8, Vec<u8>)> {
     let header = read_exact(stream, 2).await?;
     let fin = header[0] & 0x80 != 0;
     let opcode = header[0] & 0x0F;
@@ -488,7 +778,7 @@ async fn read_frame(stream: &mut TcpStream) -> Result<(bool, u8, Vec<u8>)> {
             anyhow::bail!("websocket frame length has the reserved high bit set");
         }
     }
-    if len > 1_000_000 {
+    if len > max_len as u64 {
         anyhow::bail!("websocket frame is too large");
     }
     if !masked {

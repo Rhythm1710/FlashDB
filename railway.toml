@@ -1,0 +1,14 @@
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+healthcheckPath = "/healthz"
+healthcheckTimeout = 30
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 5
+
+# Set FLASHDB_TRUST_PROXY=1 on the Railway service (dashboard or CLI), not in
+# the image. Railway's edge is the TCP peer, so the per-client cap needs
+# X-Real-IP or the right-most X-Forwarded-For entry. The image leaves the
+# variable unset so a direct run of the image does not trust those headers.

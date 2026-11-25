@@ -242,6 +242,7 @@ fn is_known_command(name: &str) -> bool {
             | "unwatch"
             | "publish"
             | "auth"
+            | "info"
     )
 }
 

@@ -11,7 +11,7 @@ use resp::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -60,6 +60,28 @@ pub enum StoredValue {
 }
 
 impl StoredValue {
+    /// Bytes of payload, not counting the key or allocator overhead. Used to
+    /// cap a public playground session.
+    fn byte_len(&self) -> usize {
+        match self {
+            StoredValue::Str(value) => value.len(),
+            StoredValue::List(items) => items.iter().map(String::len).sum(),
+            StoredValue::Hash(fields) => fields.iter().map(|(k, v)| k.len() + v.len()).sum(),
+            StoredValue::Stream(stream) => stream
+                .entries
+                .iter()
+                .map(|entry| {
+                    entry
+                        .fields
+                        .iter()
+                        .map(|(k, v)| k.len() + v.len())
+                        .sum::<usize>()
+                })
+                .sum(),
+            StoredValue::ZSet(zset) => zset.approx_bytes(),
+        }
+    }
+
     /// The Redis type name reported by the `TYPE` command: `string`, `list`,
     /// `hash`, `stream`, `zset`, and in future `set`. A missing key is handled
     /// by the caller (Redis reports `none`), so there is no variant for it
@@ -81,6 +103,7 @@ impl StoredValue {
 /// the request that created it only until a chosen `Instant`. `expires_at` of
 /// `None` means "lives forever"; `Some(deadline)` means the key is gone the
 /// moment `Instant::now()` passes `deadline`.
+#[derive(Clone)]
 pub struct Entry {
     value: StoredValue,
     expires_at: Option<Instant>,
@@ -625,6 +648,35 @@ impl Server {
     fn version_of(&self, key: &str) -> u64 {
         self.versions.lock().unwrap().get(key).copied().unwrap_or(0)
     }
+
+    /// An empty keyspace that is not shared with any other [`Server`]. The
+    /// public playground gives one of these to each browser session and drops
+    /// it when the socket closes. `rdb_path` is where `SAVE` would write; the
+    /// playground blocks that command, so the file stays absent.
+    pub fn isolated(rdb_path: PathBuf) -> Self {
+        Self::new(empty_store(), rdb_path)
+    }
+
+    /// Approximate payload bytes currently stored, including key names.
+    pub fn used_memory(&self) -> usize {
+        let space = self.store.lock().unwrap();
+        space
+            .entries
+            .iter()
+            .map(|(key, entry)| key.len() + entry.value.byte_len())
+            .sum()
+    }
+
+    /// Copy the keyspace so a public session can undo a write that exceeds
+    /// its memory cap. The expiry index is rebuilt on [`restore_entries`].
+    pub fn snapshot_entries(&self) -> HashMap<String, Entry> {
+        self.store.lock().unwrap().entries.clone()
+    }
+
+    /// Replace the keyspace, including the TTL index, with `entries`.
+    pub fn restore_entries(&self, entries: HashMap<String, Entry>) {
+        *self.store.lock().unwrap() = Keyspace::from_map(entries);
+    }
 }
 
 /// Borrow a command frame's argument values (everything after the command name),
@@ -949,6 +1001,7 @@ pub fn process_command(value: Value, server: &Server) -> Value {
         "zincrby" => commands::sorted_sets::zincrby(&args, storage),
         "zrangebyscore" => commands::sorted_sets::zrangebyscore(&args, storage),
         "zcount" => commands::sorted_sets::zcount(&args, storage),
+        "info" => info(&args, server),
         "save" => commands::persistence::save(&args, server),
         "bgsave" => commands::persistence::bgsave(&args, server),
         // A replica announces its listening port and capabilities with REPLCONF
@@ -1021,7 +1074,7 @@ fn bump_versions(versions: &Versions, name: &str, args: &[Value]) {
 /// streamed to replicas; reads stay local to whichever server received them.
 /// Kept as one list so it's obvious which commands replicate — extend it in
 /// lock-step with the dispatch table above whenever a new write lands.
-fn is_write_command(name: &str) -> bool {
+pub fn is_write_command(name: &str) -> bool {
     matches!(
         name,
         "set"
@@ -1290,6 +1343,69 @@ fn wrong_type() -> Value {
     Value::Error("WRONGTYPE Operation against a key holding the wrong kind of value".to_string())
 }
 
+fn process_started() -> Instant {
+    static STARTED: OnceLock<Instant> = OnceLock::new();
+    *STARTED.get_or_init(Instant::now)
+}
+
+fn human_bytes(bytes: usize) -> String {
+    if bytes < 1024 {
+        format!("{bytes}B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1}K", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1}M", bytes as f64 / (1024.0 * 1024.0))
+    }
+}
+
+/// `INFO` — a small Redis-style report. The playground's Instance tab reads
+/// `role`, `used_memory`, `used_memory_human`, `uptime_in_seconds`,
+/// `connected_slaves`, and the per-type `*_keys` lines.
+fn info(args: &[Value], server: &Server) -> Value {
+    if !args.is_empty() {
+        return wrong_args("info");
+    }
+    let space = server.store.lock().unwrap();
+    let mut strings = 0usize;
+    let mut lists = 0usize;
+    let mut hashes = 0usize;
+    let mut streams = 0usize;
+    let mut zsets = 0usize;
+    let mut memory = 0usize;
+    for (key, entry) in space.entries.iter() {
+        memory += key.len() + entry.value.byte_len();
+        match &entry.value {
+            StoredValue::Str(_) => strings += 1,
+            StoredValue::List(_) => lists += 1,
+            StoredValue::Hash(_) => hashes += 1,
+            StoredValue::Stream(_) => streams += 1,
+            StoredValue::ZSet(_) => zsets += 1,
+        }
+    }
+    let keys = space.len();
+    drop(space);
+    let uptime = process_started().elapsed().as_secs();
+    let text = format!(
+        "# Server\r\n\
+         redis_version:0.1.0\r\n\
+         role:master\r\n\
+         connected_slaves:0\r\n\
+         uptime_in_seconds:{uptime}\r\n\
+         used_memory:{memory}\r\n\
+         used_memory_human:{human}\r\n\
+         dbfilename:\r\n\
+         # Keyspace\r\n\
+         keys:{keys}\r\n\
+         string_keys:{strings}\r\n\
+         list_keys:{lists}\r\n\
+         hash_keys:{hashes}\r\n\
+         stream_keys:{streams}\r\n\
+         zset_keys:{zsets}\r\n",
+        human = human_bytes(memory),
+    );
+    Value::BulkString(text)
+}
+
 /// `AUTH <password>` or `AUTH <username> <password>` — log this connection in
 /// when `--requirepass` is set.
 ///
@@ -1384,6 +1500,35 @@ mod tests {
 
     fn bulk(s: &str) -> Value {
         Value::BulkString(s.to_string())
+    }
+
+    fn frame(parts: &[&str]) -> Value {
+        Value::Array(parts.iter().map(|part| bulk(part)).collect())
+    }
+
+    #[test]
+    fn dbsize_and_info_report_one_sessions_keys() {
+        let server = Server::isolated(PathBuf::from("unused.rdb"));
+        assert_eq!(
+            process_command(frame(&["DBSIZE"]), &server),
+            Value::Integer(0)
+        );
+        assert_eq!(
+            process_command(frame(&["SET", "greeting", "hi"]), &server),
+            Value::SimpleString("OK".to_string())
+        );
+        assert_eq!(
+            process_command(frame(&["DBSIZE"]), &server),
+            Value::Integer(1)
+        );
+        let report = process_command(frame(&["INFO"]), &server);
+        let Value::BulkString(text) = report else {
+            panic!("INFO should be a bulk string");
+        };
+        assert!(text.contains("role:master"), "{text}");
+        assert!(text.contains("string_keys:1"), "{text}");
+        assert!(text.contains("used_memory:"), "{text}");
+        assert!(server.used_memory() >= "greeting".len() + "hi".len());
     }
 
     // Small helper: turn a slice of &str into the owned String iterator
