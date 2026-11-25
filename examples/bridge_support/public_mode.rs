@@ -40,13 +40,53 @@ impl Default for Limits {
     }
 }
 
-/// Largest WebSocket text message a public session will assemble: one key,
-/// one value, and a little room for the command word and separators.
+/// Largest command text a public session will run. A key plus two values at
+/// the size caps (`HSET key field value`) fits, with room for the command
+/// word and spaces. A longer line is an error reply; the socket stays open.
 pub fn max_message_bytes(limits: &Limits) -> usize {
     limits
         .max_key
-        .saturating_add(limits.max_value)
+        .saturating_add(limits.max_value.saturating_mul(2))
         .saturating_add(256)
+}
+
+pub fn command_line_too_long(line: &str, limits: &Limits) -> bool {
+    line.len() > max_message_bytes(limits)
+}
+
+/// Address used for the per-client session cap.
+///
+/// The default is the TCP peer. `FLASHDB_TRUST_PROXY` opts in to `X-Real-IP`,
+/// then the right-most `X-Forwarded-For` entry. A missing or unparseable
+/// header keeps the peer address.
+pub fn client_ip(
+    peer: IpAddr,
+    trust_proxy: bool,
+    real_ip: Option<&str>,
+    forwarded_for: Option<&str>,
+) -> IpAddr {
+    if !trust_proxy {
+        return peer;
+    }
+    if let Some(ip) = real_ip.and_then(parse_header_ip) {
+        return ip;
+    }
+    if let Some(header) = forwarded_for {
+        if let Some(last) = header.rsplit(',').next() {
+            if let Some(ip) = parse_header_ip(last) {
+                return ip;
+            }
+        }
+    }
+    peer
+}
+
+fn parse_header_ip(raw: &str) -> Option<IpAddr> {
+    let token = raw.trim().trim_matches('"');
+    if token.is_empty() {
+        return None;
+    }
+    token.parse().ok()
 }
 
 /// How many public sessions are open. `try_enter` fails when the cap is hit,
@@ -517,6 +557,53 @@ mod tests {
         assert!(matches!(gate.try_enter(other), Admit::TooManySessions));
         drop(first);
         assert!(matches!(gate.try_enter(other), Admit::Admitted(_)));
+    }
+
+    #[test]
+    fn message_cap_fits_one_hset_of_two_max_sized_arguments() {
+        let limits = Limits::default();
+        let key = "k".repeat(limits.max_key);
+        let field = "f".repeat(limits.max_value);
+        let value = "v".repeat(limits.max_value);
+        let line = format!("HSET {key} {field} {value}");
+        assert!(
+            !command_line_too_long(&line, &limits),
+            "len {} cap {}",
+            line.len(),
+            max_message_bytes(&limits)
+        );
+        let extra = format!("{line} {}", "x".repeat(257));
+        assert!(command_line_too_long(&extra, &limits));
+    }
+
+    #[test]
+    fn client_ip_uses_the_peer_unless_the_proxy_is_trusted() {
+        let peer = IpAddr::from([10, 0, 0, 1]);
+        let real = "203.0.113.9";
+        let forwarded = "198.51.100.4, 203.0.113.8";
+        assert_eq!(
+            client_ip(peer, false, Some(real), Some(forwarded)),
+            peer,
+            "headers are ignored until FLASHDB_TRUST_PROXY is set"
+        );
+        assert_eq!(
+            client_ip(peer, true, Some(real), Some(forwarded)),
+            "203.0.113.9".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(
+            client_ip(peer, true, None, Some(forwarded)),
+            "203.0.113.8".parse::<IpAddr>().unwrap(),
+            "the right-most X-Forwarded-For entry"
+        );
+        assert_eq!(
+            client_ip(peer, true, Some("not-an-ip"), Some("also-bad, still-bad")),
+            peer
+        );
+        assert_eq!(client_ip(peer, true, None, None), peer);
+        assert_eq!(
+            client_ip(peer, true, Some(" 2001:db8::8 "), None),
+            "2001:db8::8".parse::<IpAddr>().unwrap()
+        );
     }
 
     #[test]
