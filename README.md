@@ -42,19 +42,41 @@ flashdb -p 7000 --dir /var/lib/flashdb --dbfilename snapshot.rdb
 current directory and `dump.rdb`; they locate the on-disk snapshot FlashDB loads
 at startup and writes on `SAVE` / `BGSAVE` (see [Persistence](#persistence-rdb)
 below). `--replicaof <host> <port>` starts the server as a replica that syncs
-from a master on boot (see [Replication](#replication) below). An unknown flag or
-a flag missing its value prints a message and exits non-zero rather than
-starting.
+from a master on boot (see [Replication](#replication) below).
+`--requirepass <password>` demands `AUTH` before any other command (see
+[Authentication](#authentication)). An unknown flag or a flag missing its
+value prints a message and exits non-zero rather than starting.
+
+## Authentication
+
+`--requirepass <password>` makes the server refuse every command until that
+connection sends `AUTH <password>` or `AUTH default <password>`. Any other
+username is `WRONGPASS`. Until then the reply is
+`-NOAUTH Authentication required.` `QUIT` is the exception: it closes the
+connection without logging in. `AUTH` with the wrong password replies
+`-WRONGPASS invalid username-password pair or user is disabled.` and leaves
+the connection unauthenticated, including a connection that had already
+logged in. The password compare does not stop at the first differing byte.
+Authentication is per connection: one client logging in does not
+unlock any other. With no `--requirepass`, `AUTH` replies with an error and
+every other command runs as usual.
+
+The built-in replica handshake does not send `AUTH`, so a master started with
+`--requirepass` rejects a `--replicaof` replica until a master password is
+wired up.
 
 ## Implemented commands
 
 - `PING`
+- `AUTH [username] password`
+- `QUIT`
 - `ECHO`
 - `SET key value [EX seconds | PX milliseconds]`
 - `GET`
 - `DEL`
 - `EXPIRE key seconds`
 - `TTL key`
+- `DBSIZE`
 - `PERSIST key`
 - `TYPE key`
 - `RPUSH key value [value ...]`
@@ -212,9 +234,15 @@ never holds the store lock while waiting, and a single `XADD` wakes every client
 blocked on that stream. Inside a `MULTI`/`EXEC` transaction a `BLOCK` is ignored
 (the queued read runs as a non-blocking pass), matching Redis.
 
-Streams are not yet persisted to RDB (real Redis uses a listpack/radix-tree
-encoding FlashDB does not emit yet), and the consumer-group commands
-(`XACK`/`XCLAIM`/…) are still to come.
+`SAVE` / `BGSAVE` persist a stream: the high-water `last_id`, then every
+surviving entry's id and field/value pairs. The on-disk record is FlashDB's
+own (value type `0xE0`) rather than Redis's listpack/radix-tree encoding,
+which FlashDB still does not read or write. A snapshot that contains a stream
+reloads here — including a high-water mark left behind by `XDEL` / `XTRIM`,
+so a later `XADD` cannot reuse a deleted id — while a real `redis-server`
+rejects that file. A snapshot with no stream keys stays loadable by Redis,
+same as before. The consumer-group commands (`XACK`/`XCLAIM`/…) are still to
+come.
 
 ## Sorted sets
 
@@ -266,9 +294,13 @@ the entry to remove, the same trick streams use for `XRANGE`.
 `ZRANGEBYSCORE`/`ZCOUNT` share one more binary search on that same `Vec` —
 `partition_point` on the score alone finds the boundary of a whole run of
 tied scores in one pass, since ties are already grouped together by the
-existing sort order. Sorted sets are not yet persisted to RDB (real Redis
-uses its own listpack/skiplist encoding), and a reverse `ZRANGE ... REV` is
-still to come.
+existing sort order. Sorted sets are persisted as Redis's `ZSET_2` record
+(a count, then each member as a string and its score as a little-endian
+binary double). FlashDB also reads the older `ZSET` encoding, where the score
+is decimal text with the `253` / `254` / `255` sentinels for NaN and the
+infinities. A snapshot FlashDB writes therefore loads back into FlashDB and
+into an unmodified `redis-server`. A reverse `ZRANGE ... REV` is still to
+come.
 
 ## Value types
 
@@ -318,9 +350,18 @@ one on an existing key. `TTL key` returns the seconds remaining (`-1` if the
 key has no expiry, `-2` if it doesn't exist), and `PERSIST key` removes an
 expiry so the key lives forever again.
 
-Expiry is *passive*: a key past its deadline stays in memory until something
-touches it, at which point the read drops it and reports it as missing — so an
-expired key is indistinguishable from one that was never set.
+Expiry is checked two ways. A read of a key past its deadline drops it and
+reports it missing (passive expiry), so an expired key is indistinguishable
+from one that was never set. A background sweep also samples keys that carry
+a TTL — 20 at a time, and again while more than a quarter of the sample is
+already expired, the same rule Redis uses — and deletes the ones it finds
+due, so a key nobody reads still leaves memory. The sweep keeps a side
+index of keys that have a TTL and samples that index (20 keys a pass) instead
+of scanning the whole keyspace. It drops the store lock between passes and
+runs about every 100ms. The task is aborted when the accept loop ends, which
+is the only way this server stops. `DBSIZE` reports how many keys are stored,
+including expired ones the sweep has not removed yet; calling it does not
+expire anything itself.
 
 ## Persistence (RDB)
 
@@ -349,10 +390,13 @@ started` immediately so the client isn't blocked on the disk (real Redis forks a
 child process for the same effect). Both write the file atomically — to a temp
 file, then a rename — so a crash mid-write never leaves a half-written snapshot.
 
-Strings, lists, and hashes are all serialized, each with its optional expiry.
+Strings, lists, hashes, and sorted sets are serialized in the encodings Redis
+itself uses (sorted sets as `ZSET_2`), each with its optional expiry. Streams
+are serialized too, in the FlashDB record described under [Streams](#streams):
+a snapshot that includes one reloads here, and is rejected by `redis-server`.
 Because the on-disk bytes are real RDB — right down to the CRC64 trailer Redis
-verifies on load — a snapshot FlashDB writes loads straight back into FlashDB
-*and* into an unmodified `redis-server`:
+verifies on load — a snapshot of strings, lists, hashes, and sorted sets loads
+straight back into FlashDB *and* into an unmodified `redis-server`:
 
 ```sh
 redis-cli -p 6379 SET greeting "hello world"

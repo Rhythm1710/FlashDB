@@ -428,16 +428,80 @@ pub(crate) fn zcount(args: &[Value], storage: &Store) -> Value {
     }
 }
 
+/// Append a sorted set in Redis's `ZSET_2` payload layout: a count, then each
+/// member as a string followed by its score as an 8-byte little-endian IEEE
+/// double. Members are written in ascending `(score, member)` order. The type
+/// byte itself is written by `rdb::write`; this is only the payload
+/// [`read_zset`] consumes when `binary_scores` is set.
+pub(crate) fn write_zset(buf: &mut Vec<u8>, zset: &ZSet) {
+    use crate::rdb::write::{write_length, write_string};
+    let members = zset.range(0, -1);
+    write_length(buf, members.len() as u64);
+    for (member, score) in members {
+        write_string(buf, member);
+        buf.extend_from_slice(&score.to_le_bytes());
+    }
+}
+
+/// Inverse of [`write_zset`], plus the older `ZSET` score encoding (a length
+/// byte, then decimal text, with `254`/`255` meaning `+inf`/`-inf`).
+/// `binary_scores` selects `ZSET_2`. A NaN score or a repeated member is an
+/// error, matching what Redis refuses to load.
+pub(crate) fn read_zset(
+    cur: &mut crate::rdb::Cursor,
+    binary_scores: bool,
+) -> Result<ZSet, crate::rdb::RdbError> {
+    use crate::rdb::{read_count, read_string, RdbError};
+    let count = read_count(cur)?;
+    let mut zset = ZSet::default();
+    for _ in 0..count {
+        let member = read_string(cur)?;
+        let score = if binary_scores {
+            read_binary_score(cur)?
+        } else {
+            read_legacy_score(cur)?
+        };
+        if score.is_nan() {
+            return Err(RdbError::InvalidScore);
+        }
+        if !zset.insert(member, score) {
+            return Err(RdbError::DuplicateZSetMember);
+        }
+    }
+    Ok(zset)
+}
+
+fn read_binary_score(cur: &mut crate::rdb::Cursor) -> Result<f64, crate::rdb::RdbError> {
+    let bytes = cur.read_bytes(8)?;
+    let mut arr = [0u8; 8];
+    arr.copy_from_slice(bytes);
+    Ok(f64::from_le_bytes(arr))
+}
+
+/// Redis's pre-`ZSET_2` score: one length byte, then that many bytes of
+/// decimal text. `253` is NaN, `254` is `+inf`, `255` is `-inf`.
+fn read_legacy_score(cur: &mut crate::rdb::Cursor) -> Result<f64, crate::rdb::RdbError> {
+    use crate::rdb::RdbError;
+    match cur.read_u8()? {
+        255 => Ok(f64::NEG_INFINITY),
+        254 => Ok(f64::INFINITY),
+        253 => Err(RdbError::InvalidScore),
+        len => {
+            let bytes = cur.read_bytes(len as usize)?;
+            let text = std::str::from_utf8(bytes).map_err(|_| RdbError::InvalidScore)?;
+            text.parse::<f64>().map_err(|_| RdbError::InvalidScore)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::resp::Value;
     use crate::{get, set, type_cmd, wrong_type};
-    use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
 
     fn store() -> Store {
-        Arc::new(Mutex::new(HashMap::new()))
+        crate::empty_store()
     }
 
     fn bulk(s: &str) -> Value {
@@ -820,5 +884,41 @@ mod tests {
             zcount(&[bulk("z"), bulk("10"), bulk("20")], &s),
             Value::Integer(0)
         );
+    }
+
+    #[test]
+    fn rdb_payload_round_trips_scores_including_infinity() {
+        let mut zset = ZSet::default();
+        zset.insert("c".to_string(), -2.5);
+        zset.insert("a".to_string(), 1.0);
+        zset.insert("top".to_string(), f64::INFINITY);
+        let mut buf = Vec::new();
+        write_zset(&mut buf, &zset);
+        let mut cur = crate::rdb::Cursor::new(&buf);
+        assert_eq!(read_zset(&mut cur, true).unwrap(), zset);
+    }
+
+    #[test]
+    fn legacy_string_scores_load_infinities_and_decimals() {
+        use crate::rdb::write::write_string;
+        use crate::rdb::RdbError;
+        let mut buf = Vec::new();
+        crate::rdb::write::write_length(&mut buf, 2);
+        write_string(&mut buf, "low");
+        buf.push(255); // -inf
+        write_string(&mut buf, "n");
+        buf.push(1);
+        buf.push(b'2');
+        let mut cur = crate::rdb::Cursor::new(&buf);
+        let zset = read_zset(&mut cur, false).unwrap();
+        assert_eq!(zset.score("low"), Some(f64::NEG_INFINITY));
+        assert_eq!(zset.score("n"), Some(2.0));
+
+        let mut nan = Vec::new();
+        crate::rdb::write::write_length(&mut nan, 1);
+        write_string(&mut nan, "bad");
+        nan.push(253);
+        let mut cur = crate::rdb::Cursor::new(&nan);
+        assert_eq!(read_zset(&mut cur, false), Err(RdbError::InvalidScore));
     }
 }

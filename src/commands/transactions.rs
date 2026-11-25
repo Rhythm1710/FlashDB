@@ -209,6 +209,7 @@ fn is_known_command(name: &str) -> bool {
             | "del"
             | "expire"
             | "ttl"
+            | "dbsize"
             | "persist"
             | "type"
             | "rpush"
@@ -240,7 +241,7 @@ fn is_known_command(name: &str) -> bool {
             | "watch"
             | "unwatch"
             | "publish"
-            | "dbsize"
+            | "auth"
             | "info"
     )
 }
@@ -250,13 +251,11 @@ mod tests {
     use super::*;
     use crate::{get, Store};
     use bytes::Bytes;
-    use std::collections::HashMap;
     use std::path::PathBuf;
-    use std::sync::{Arc, Mutex};
     use tokio::sync::mpsc;
 
     fn store() -> Store {
-        Arc::new(Mutex::new(HashMap::new()))
+        crate::empty_store()
     }
 
     fn bulk(s: &str) -> Value {

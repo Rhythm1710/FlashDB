@@ -18,7 +18,6 @@ use crate::{
     command_args, command_name, expire_if_due, now_unix_ms, stream, unpack_bulk_str, wrong_args,
     wrong_type, Entry, Server, Store, StoredValue,
 };
-use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use stream::Stream;
 use tokio::time::timeout;
@@ -474,7 +473,7 @@ fn parse_xread(args: &[Value]) -> Result<XReadRequest, String> {
 /// wrong-typed key aborts the whole read with `WRONGTYPE`. Needs `&mut` only to
 /// run passive expiry before reading.
 fn resolve_after_ids(
-    store: &mut HashMap<String, Entry>,
+    store: &mut crate::Keyspace,
     req: &XReadRequest,
 ) -> Result<Vec<stream::StreamId>, Value> {
     let now = Instant::now();
@@ -503,7 +502,7 @@ fn resolve_after_ids(
 /// pair. Returns the nil array (`Value::NullArray`) when nothing is new, exactly
 /// as Redis does. Read-only — the caller holds the lock.
 fn xread_collect(
-    store: &HashMap<String, Entry>,
+    store: &crate::Keyspace,
     req: &XReadRequest,
     afters: &[stream::StreamId],
 ) -> Value {
@@ -622,15 +621,78 @@ pub(crate) fn as_blocking_xread(value: &Value) -> Option<XReadRequest> {
     req.block.map(|_| req)
 }
 
+/// Append a stream's on-disk payload: the high-water id, then each entry's id
+/// and its field/value pairs in insertion order.
+///
+/// Redis stores streams as listpacks inside a radix tree. FlashDB does not
+/// emit that encoding. This layout is what [`read_stream`] reads back, and
+/// `rdb::write` tags it with the FlashDB stream type byte. `last_id` is
+/// written even when it sits above every surviving entry, so a deleted id
+/// stays retired across a save/load.
+pub(crate) fn write_stream(buf: &mut Vec<u8>, stream: &Stream) {
+    use crate::rdb::write::{write_length, write_string};
+    write_length(buf, stream.last_id.ms);
+    write_length(buf, stream.last_id.seq);
+    write_length(buf, stream.entries.len() as u64);
+    for entry in &stream.entries {
+        write_length(buf, entry.id.ms);
+        write_length(buf, entry.id.seq);
+        write_length(buf, entry.fields.len() as u64);
+        for (field, value) in &entry.fields {
+            write_string(buf, field);
+            write_string(buf, value);
+        }
+    }
+}
+
+/// Inverse of [`write_stream`]. Entry ids must be strictly increasing; a
+/// corrupt or truncated payload surfaces as an [`RdbError`] rather than a
+/// half-built stream.
+pub(crate) fn read_stream(cur: &mut crate::rdb::Cursor) -> Result<Stream, crate::rdb::RdbError> {
+    use crate::rdb::{read_count, read_string, RdbError};
+    use stream::{StreamEntry, StreamId};
+    let last_id = StreamId {
+        ms: read_count(cur)?,
+        seq: read_count(cur)?,
+    };
+    let count = read_count(cur)?;
+    let mut entries = Vec::new();
+    let mut previous: Option<StreamId> = None;
+    for _ in 0..count {
+        let id = StreamId {
+            ms: read_count(cur)?,
+            seq: read_count(cur)?,
+        };
+        if previous.is_some_and(|prev| id <= prev) {
+            return Err(RdbError::UnsortedStream);
+        }
+        previous = Some(id);
+        let n_fields = read_count(cur)?;
+        // Don't pre-size from the on-disk count: a corrupt huge value would
+        // allocate before the reads that fail anyway run out of bytes.
+        let mut fields = Vec::new();
+        for _ in 0..n_fields {
+            fields.push((read_string(cur)?, read_string(cur)?));
+        }
+        entries.push(StreamEntry { id, fields });
+    }
+    let mut stream = Stream { entries, last_id };
+    // The high-water mark is never allowed to fall behind a stored entry.
+    if let Some(top) = stream.entries.last().map(|entry| entry.id) {
+        if stream.last_id < top {
+            stream.last_id = top;
+        }
+    }
+    Ok(stream)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{get, process_command, set, type_cmd};
-    use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
 
     fn store() -> Store {
-        Arc::new(Mutex::new(HashMap::new()))
+        crate::empty_store()
     }
 
     fn bulk(s: &str) -> Value {
@@ -1146,5 +1208,42 @@ mod tests {
             other => panic!("expected entries array, got {:?}", other),
         };
         assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn rdb_payload_keeps_entries_and_a_high_water_mark_above_them() {
+        use crate::stream::StreamId;
+        let mut stream = Stream::default();
+        stream.append(
+            StreamId { ms: 1, seq: 0 },
+            vec![("f".into(), "v".into()), ("f".into(), "again".into())],
+        );
+        stream.append(
+            StreamId { ms: 2, seq: 1 },
+            vec![("name".into(), "ada".into())],
+        );
+        // A deleted tail: last_id sits strictly above every surviving entry.
+        stream.last_id = StreamId { ms: 9, seq: 4 };
+        let mut buf = Vec::new();
+        write_stream(&mut buf, &stream);
+        let mut cur = crate::rdb::Cursor::new(&buf);
+        assert_eq!(read_stream(&mut cur).unwrap(), stream);
+    }
+
+    #[test]
+    fn rdb_payload_rejects_an_id_that_does_not_move_forward() {
+        use crate::rdb::write::write_length;
+        use crate::rdb::RdbError;
+        let mut buf = Vec::new();
+        write_length(&mut buf, 2); // last ms
+        write_length(&mut buf, 0); // last seq
+        write_length(&mut buf, 2); // two entries
+        for (ms, seq) in [(1u64, 0u64), (1u64, 0u64)] {
+            write_length(&mut buf, ms);
+            write_length(&mut buf, seq);
+            write_length(&mut buf, 0); // no fields
+        }
+        let mut cur = crate::rdb::Cursor::new(&buf);
+        assert_eq!(read_stream(&mut cur), Err(RdbError::UnsortedStream));
     }
 }

@@ -9,7 +9,7 @@
 //! groups still awaiting extraction use them too.
 
 use crate::resp::Value;
-use crate::{rdb, unpack_int, wrong_args, Entry, Replicas, Server, Store, StoredValue};
+use crate::{rdb, unpack_int, wrong_args, Entry, Replicas, Server, Store};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -31,16 +31,6 @@ fn map_to_rdb_entries(
     for (key, entry) in map {
         if entry.is_expired_at(now) {
             continue; // a key that has already lapsed is not worth persisting
-        }
-        if matches!(entry.value, StoredValue::Stream(_) | StoredValue::ZSet(_)) {
-            // Real Redis persists streams with a listpack/radix-tree encoding,
-            // and sorted sets with their own listpack/skiplist encoding — we
-            // neither write nor read either format yet, so both are skipped
-            // rather than emitted in a shape a real `redis-server` couldn't
-            // load. (This filter is the single source of truth; the
-            // exhaustive arms in `rdb::write` exist only for the type system
-            // and never run.)
-            continue;
         }
         let expire_at_ms = entry.expires_at.map(|deadline| {
             // How far the deadline sits ahead of `now` on the monotonic clock,
@@ -68,8 +58,8 @@ pub(crate) fn snapshot_bytes(store: &Store) -> Vec<u8> {
     let now = Instant::now();
     let unix_ms = crate::now_unix_ms();
     let entries = {
-        let map = store.lock().unwrap();
-        map_to_rdb_entries(&map, unix_ms, now)
+        let space = store.lock().unwrap();
+        map_to_rdb_entries(&space.entries, unix_ms, now)
     };
     rdb::write::serialize(&entries)
 }
@@ -161,14 +151,15 @@ mod tests {
     use super::*;
     use crate::commands::hashes::hset;
     use crate::commands::lists::{push, Side};
-    use crate::{load_store_from_rdb, set, Config};
+    use crate::commands::sorted_sets::zadd;
+    use crate::commands::streams::xadd;
+    use crate::{load_store_from_rdb, set, Config, StoredValue};
     use bytes::Bytes;
-    use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tokio::sync::mpsc;
 
     fn store() -> Store {
-        Arc::new(Mutex::new(HashMap::new()))
+        crate::empty_store()
     }
 
     fn bulk(s: &str) -> Value {
@@ -263,6 +254,8 @@ mod tests {
         set(&[bulk("greeting"), bulk("hello world")], &s);
         push(&[bulk("l"), bulk("a"), bulk("b")], &s, Side::Right);
         hset(&[bulk("h"), bulk("f"), bulk("v")], &s);
+        xadd(&[bulk("s"), bulk("1-0"), bulk("f"), bulk("v")], &s);
+        zadd(&[bulk("z"), bulk("1.5"), bulk("m")], &s);
         let server = Server::new(s.clone(), path.clone());
         assert_eq!(save(&[], &server), Value::SimpleString("OK".to_string()));
 
@@ -272,6 +265,7 @@ mod tests {
             dir: dir.to_string_lossy().into_owned(),
             dbfilename: "dump.rdb".to_string(),
             replicaof: None,
+            requirepass: None,
         };
         let reloaded = load_store_from_rdb(&cfg).unwrap();
 
@@ -291,6 +285,19 @@ mod tests {
         match &reloaded.get("h").unwrap().value {
             StoredValue::Hash(map) => assert_eq!(map.get("f").map(String::as_str), Some("v")),
             other => panic!("expected a hash, got {other:?}"),
+        }
+        match &reloaded.get("s").unwrap().value {
+            StoredValue::Stream(stream) => {
+                assert_eq!(stream.entries.len(), 1);
+                assert_eq!(stream.entries[0].id.to_string(), "1-0");
+                assert_eq!(stream.entries[0].fields, vec![("f".into(), "v".into())]);
+                assert_eq!(stream.last_id.to_string(), "1-0");
+            }
+            other => panic!("expected a stream, got {other:?}"),
+        }
+        match &reloaded.get("z").unwrap().value {
+            StoredValue::ZSet(zset) => assert_eq!(zset.score("m"), Some(1.5)),
+            other => panic!("expected a sorted set, got {other:?}"),
         }
 
         let _ = std::fs::remove_dir_all(&dir);

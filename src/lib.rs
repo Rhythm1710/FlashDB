@@ -8,7 +8,7 @@
 use anyhow::Result;
 use bytes::Bytes;
 use resp::Value;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -131,18 +131,286 @@ impl Entry {
     }
 }
 
+/// Keys that currently carry a deadline, stored so a sweep can pick a sample
+/// in O(sample) instead of walking the whole keyspace.
+///
+/// `keys` is random-access. `pos` is the index of each key in `keys`, so
+/// insert and remove stay O(1) via swap-remove. FlashDB has no `RENAME`
+/// command; [`Keyspace::rename`] is the update that command must use if it
+/// is added, and it is what tests use to prove a rename keeps the index honest.
+#[derive(Debug, Default)]
+struct ExpiryIndex {
+    keys: Vec<String>,
+    pos: HashMap<String, usize>,
+}
+
+impl ExpiryIndex {
+    fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    fn insert(&mut self, key: String) {
+        if self.pos.contains_key(&key) {
+            return;
+        }
+        self.pos.insert(key.clone(), self.keys.len());
+        self.keys.push(key);
+    }
+
+    fn remove(&mut self, key: &str) {
+        let Some(index) = self.pos.remove(key) else {
+            return;
+        };
+        self.keys.swap_remove(index);
+        if let Some(moved) = self.keys.get(index) {
+            self.pos.insert(moved.clone(), index);
+        }
+    }
+
+    fn key_at(&self, index: usize) -> &str {
+        &self.keys[index]
+    }
+}
+
+/// The keyspace plus the TTL index. One mutex covers both so a write cannot
+/// update a key's deadline and forget the index.
+#[derive(Default)]
+pub struct Keyspace {
+    pub(crate) entries: HashMap<String, Entry>,
+    expiring: ExpiryIndex,
+}
+
+impl Keyspace {
+    fn from_map(entries: HashMap<String, Entry>) -> Self {
+        let mut expiring = ExpiryIndex::default();
+        for (key, entry) in &entries {
+            if entry.expires_at.is_some() {
+                expiring.insert(key.clone());
+            }
+        }
+        Keyspace { entries, expiring }
+    }
+
+    fn get(&self, key: &str) -> Option<&Entry> {
+        self.entries.get(key)
+    }
+
+    fn get_mut(&mut self, key: &str) -> Option<&mut Entry> {
+        self.entries.get_mut(key)
+    }
+
+    fn contains_key(&self, key: &str) -> bool {
+        self.entries.contains_key(key)
+    }
+
+    /// `or_insert_with` for a key that does not exist yet. Callers insert an
+    /// entry with no deadline; an existing key keeps the deadline it had.
+    fn entry(&mut self, key: String) -> std::collections::hash_map::Entry<'_, String, Entry> {
+        self.entries.entry(key)
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Insert `entry`, replacing any previous value, and record whether the
+    /// new value has a deadline. A plain `SET` clears a previous TTL because
+    /// the fresh entry has `expires_at: None`.
+    fn insert(&mut self, key: String, entry: Entry) -> Option<Entry> {
+        let expires = entry.expires_at.is_some();
+        let old = self.entries.insert(key.clone(), entry);
+        if expires {
+            self.expiring.insert(key);
+        } else {
+            self.expiring.remove(&key);
+        }
+        old
+    }
+
+    fn remove(&mut self, key: &str) -> Option<Entry> {
+        self.expiring.remove(key);
+        self.entries.remove(key)
+    }
+
+    /// Re-read `key`'s deadline after a caller changed it through [`get_mut`]
+    /// (`EXPIRE` and `PERSIST` do that).
+    fn sync_expiry(&mut self, key: &str) {
+        let expires = self
+            .entries
+            .get(key)
+            .is_some_and(|entry| entry.expires_at.is_some());
+        if expires {
+            self.expiring.insert(key.to_string());
+        } else {
+            self.expiring.remove(key);
+        }
+    }
+
+    /// Move `from` to `to`, including its TTL-index slot. Overwrites `to`.
+    /// There is no `RENAME` command yet; this is the only rename path, and
+    /// unit tests call it so a future command cannot forget the index.
+    #[allow(dead_code)]
+    fn rename(&mut self, from: &str, to: String) -> bool {
+        let Some(entry) = self.remove(from) else {
+            return false;
+        };
+        self.insert(to, entry);
+        true
+    }
+}
+
 /// The shared key/value store. `Arc` lets every connection task hold a handle
 /// to the same map; `Mutex` serializes the reads and writes. Each value now
 /// carries its own optional expiry (see [`Entry`]).
-pub type Store = Arc<Mutex<HashMap<String, Entry>>>;
+pub type Store = Arc<Mutex<Keyspace>>;
+
+pub(crate) fn empty_store() -> Store {
+    Arc::new(Mutex::new(Keyspace::default()))
+}
 
 /// Passive expiry: if `key` is present but its deadline has passed as of
 /// `now`, drop it. Called before every read so an expired key is
-/// indistinguishable from a missing one, exactly as Redis behaves.
-fn expire_if_due(map: &mut HashMap<String, Entry>, key: &str, now: Instant) {
-    if matches!(map.get(key), Some(e) if e.is_expired_at(now)) {
-        map.remove(key);
+/// indistinguishable from a missing one. The background sweep
+/// ([`expire_one_pass`]) deletes expired keys even when nobody reads
+/// them; this path still runs so a key that expired between sweeps is not
+/// readable. Removal also drops the key from the TTL index.
+fn expire_if_due(space: &mut Keyspace, key: &str, now: Instant) {
+    if matches!(space.get(key), Some(e) if e.is_expired_at(now)) {
+        space.remove(key);
     }
+}
+
+/// How many keys that carry a TTL one sampling pass inspects. Redis's
+/// `ACTIVE_EXPIRE_CYCLE_LOOKUPS_PER_LOOP` default is 20.
+const EXPIRE_SAMPLE_SIZE: usize = 20;
+/// A pass that finds more expired keys than this percentage of its sample
+/// runs again immediately. Redis stops at 25% or below (`expired * 100 /
+/// sampled > 25` continues).
+const EXPIRE_CYCLE_SLOW_PERCENT: usize = 25;
+/// Cap on back-to-back passes so one tick cannot scan forever when the
+/// keyspace is mostly expired. Sixteen passes of 20 cover 320 deletions.
+const EXPIRE_CYCLE_MAX_PASSES: usize = 16;
+
+fn expire_rng(state: &mut u64) -> u64 {
+    let mut x = *state;
+    if x == 0 {
+        x = 0x9E37_79B9_7F4A_7C15;
+    }
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    *state = x;
+    x
+}
+
+/// Pick `sample_n` distinct positions in `0..n` without scanning a key list
+/// larger than a small multiple of the sample.
+fn sample_indices(n: usize, sample_n: usize, rng: &mut u64) -> Vec<usize> {
+    if n == 0 || sample_n == 0 {
+        return Vec::new();
+    }
+    if sample_n >= n {
+        return (0..n).collect();
+    }
+    // A short index is still O(sample). A long one is sampled by rejection,
+    // which stays O(sample) when the sample is much smaller than `n`.
+    if n <= sample_n.saturating_mul(4) {
+        let mut order: Vec<usize> = (0..n).collect();
+        for i in 0..sample_n {
+            let span = n - i;
+            let j = i + (expire_rng(rng) as usize % span);
+            order.swap(i, j);
+        }
+        order.truncate(sample_n);
+        return order;
+    }
+    let mut chosen = Vec::with_capacity(sample_n);
+    let mut seen = HashSet::new();
+    let mut spins = 0;
+    while chosen.len() < sample_n && spins < sample_n.saturating_mul(32) {
+        spins += 1;
+        let index = (expire_rng(rng) as usize) % n;
+        if seen.insert(index) {
+            chosen.push(index);
+        }
+    }
+    chosen
+}
+
+/// One Redis-style sample: look at up to [`EXPIRE_SAMPLE_SIZE`] keys that
+/// have a deadline and delete the ones already due. Returns whether another
+/// pass should run (`true` when more than 25% of the sample was expired).
+/// `None` means nothing has a TTL.
+///
+/// The caller holds `space`'s lock for this pass only and drops it before
+/// the next one.
+fn expire_one_pass(space: &mut Keyspace, now: Instant, rng: &mut u64) -> Option<bool> {
+    let n = space.expiring.len();
+    if n == 0 {
+        return None;
+    }
+    let sample_n = EXPIRE_SAMPLE_SIZE.min(n);
+    let indexes = sample_indices(n, sample_n, rng);
+    let keys: Vec<String> = indexes
+        .into_iter()
+        .map(|index| space.expiring.key_at(index).to_string())
+        .collect();
+    let sampled = keys.len();
+    if sampled == 0 {
+        return None;
+    }
+    let mut expired = 0usize;
+    for key in keys {
+        match space.get(&key) {
+            Some(entry) if entry.is_expired_at(now) => {
+                space.remove(&key);
+                expired += 1;
+            }
+            None => space.expiring.remove(&key),
+            Some(_) => {}
+        }
+    }
+    Some(expired * 100 / sampled > EXPIRE_CYCLE_SLOW_PERCENT)
+}
+
+/// Run up to [`EXPIRE_CYCLE_MAX_PASSES`] samples back to back. Used by unit
+/// tests that already hold the keyspace. The background task calls
+/// [`expire_one_pass`] itself so it can drop the mutex between passes.
+#[cfg(test)]
+fn expire_cycle(space: &mut Keyspace, rng: &mut u64) {
+    for _ in 0..EXPIRE_CYCLE_MAX_PASSES {
+        let now = Instant::now();
+        match expire_one_pass(space, now, rng) {
+            None | Some(false) => return,
+            Some(true) => {}
+        }
+    }
+}
+
+/// Drop expired keys every 100ms, the same cadence Redis's `hz 10` cron
+/// uses. Each pass locks only long enough to sample the TTL index; the lock
+/// is released before the next pass. The handle is aborted when [`serve`]
+/// returns — the accept loop has no other shutdown signal.
+fn spawn_expire_sweep(store: Store) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_millis(100));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut rng = 0xA5A5_F00D_u64;
+        loop {
+            ticker.tick().await;
+            for _ in 0..EXPIRE_CYCLE_MAX_PASSES {
+                let now = Instant::now();
+                let again = {
+                    let mut space = store.lock().unwrap();
+                    expire_one_pass(&mut space, now, &mut rng)
+                };
+                match again {
+                    None | Some(false) => break,
+                    Some(true) => {}
+                }
+            }
+        }
+    })
 }
 
 /// Startup configuration parsed from the command-line arguments.
@@ -150,7 +418,8 @@ fn expire_if_due(map: &mut HashMap<String, Entry>, key: &str, now: Instant) {
 /// These mirror the Redis server flags FlashDB understands so far: `-p`/`--port`
 /// chooses the listening port, `--dir` / `--dbfilename` name where the on-disk
 /// RDB snapshot lives, and `--replicaof <host> <port>` starts the server as a
-/// replica that syncs from a master on boot.
+/// replica that syncs from a master on boot. `--requirepass <password>`
+/// requires `AUTH` before any other command on a connection.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Config {
     pub port: u16,
@@ -161,6 +430,10 @@ pub struct Config {
     /// handshake, and loads the master's snapshot into its own keyspace. `None`
     /// means a normal standalone server. Parsed from `--replicaof <host> <port>`.
     pub replicaof: Option<(String, u16)>,
+    /// When `Some`, a connection must `AUTH` with this exact password before
+    /// any other command runs. `None` (the default) leaves the server open.
+    /// Parsed from `--requirepass <password>`.
+    pub requirepass: Option<String>,
 }
 
 impl Default for Config {
@@ -172,6 +445,7 @@ impl Default for Config {
             dir: ".".to_string(),
             dbfilename: "dump.rdb".to_string(),
             replicaof: None,
+            requirepass: None,
         }
     }
 }
@@ -215,6 +489,7 @@ impl Config {
                         .map_err(|_| format!("invalid master port number '{raw_port}'"))?;
                     config.replicaof = Some((host, port));
                 }
+                "--requirepass" => config.requirepass = Some(value_for(&mut it)?),
                 other => return Err(format!("unknown argument '{other}'")),
             }
         }
@@ -340,6 +615,9 @@ pub struct Server {
     /// streams each time it fires. A single shared `Notify` (rather than one per
     /// stream) is enough because a spurious wake just costs one extra re-check.
     stream_notify: Arc<Notify>,
+    /// `Some` when the process was started with `--requirepass`. `AUTH` on
+    /// each connection compares against it; `None` means no login is required.
+    requirepass: Option<Arc<str>>,
 }
 
 impl Server {
@@ -351,7 +629,17 @@ impl Server {
             versions: Arc::new(Mutex::new(HashMap::new())),
             subscribers: Arc::new(Mutex::new(HashMap::new())),
             stream_notify: Arc::new(Notify::new()),
+            requirepass: None,
         }
+    }
+
+    /// [`Server::new`] plus a `--requirepass` password. `None` is the open
+    /// server `new` builds; `Some` is what `run_with_config` uses when the
+    /// flag was set.
+    fn with_requirepass(store: Store, rdb_path: PathBuf, requirepass: Option<String>) -> Self {
+        let mut server = Self::new(store, rdb_path);
+        server.requirepass = requirepass.map(Arc::from);
+        server
     }
 
     /// The current version of `key`: the number of writes it has seen, or 0 for
@@ -365,13 +653,15 @@ impl Server {
     /// it when the socket closes. `rdb_path` is where `SAVE` would write; the
     /// playground blocks that command, so the file stays absent.
     pub fn isolated(rdb_path: PathBuf) -> Self {
-        Self::new(Arc::new(Mutex::new(HashMap::new())), rdb_path)
+        Self::new(empty_store(), rdb_path)
     }
 
     /// Approximate payload bytes currently stored, including key names.
     pub fn used_memory(&self) -> usize {
-        let map = self.store.lock().unwrap();
-        map.iter()
+        let space = self.store.lock().unwrap();
+        space
+            .entries
+            .iter()
             .map(|(key, entry)| key.len() + entry.value.byte_len())
             .sum()
     }
@@ -394,10 +684,7 @@ fn command_args(value: &Value) -> &[Value] {
 /// directory. Use [`run_with_config`] to load an existing RDB snapshot first and
 /// control where snapshots are written.
 pub async fn run(listener: TcpListener) -> Result<()> {
-    let server = Server::new(
-        Arc::new(Mutex::new(HashMap::new())),
-        PathBuf::from("dump.rdb"),
-    );
+    let server = Server::new(empty_store(), PathBuf::from("dump.rdb"));
     serve(listener, server).await
 }
 
@@ -408,7 +695,11 @@ pub async fn run(listener: TcpListener) -> Result<()> {
 pub async fn run_with_config(listener: TcpListener, config: &Config) -> Result<()> {
     let map = load_store_from_rdb(config)?;
     let path = std::path::Path::new(&config.dir).join(&config.dbfilename);
-    let server = Server::new(Arc::new(Mutex::new(map)), path);
+    let server = Server::with_requirepass(
+        Arc::new(Mutex::new(Keyspace::from_map(map))),
+        path,
+        config.requirepass.clone(),
+    );
 
     // If we were told to replicate, kick off the sync in the background so the
     // handshake with the master runs alongside — not before — us accepting our
@@ -437,6 +728,15 @@ pub async fn run_with_config(listener: TcpListener, config: &Config) -> Result<(
 /// `Arc` handle bump) into every connection task. This never returns under
 /// normal operation; an error is only produced if `accept` itself fails.
 async fn serve(listener: TcpListener, server: Server) -> Result<()> {
+    let sweep = spawn_expire_sweep(Arc::clone(&server.store));
+    let result = accept_loop(listener, server).await;
+    // `accept` returning is the only shutdown this server has (the listener
+    // failed). Stop the sweep so it does not keep waking after that.
+    sweep.abort();
+    result
+}
+
+async fn accept_loop(listener: TcpListener, server: Server) -> Result<()> {
     loop {
         let (stream, _) = listener.accept().await?;
         println!("accepted new connection");
@@ -457,6 +757,9 @@ async fn handle_conn(stream: TcpStream, server: Server) -> Result<()> {
     // A stable id for this connection, used to track and later remove its
     // subscriptions from the shared pub/sub routing table.
     let client_id = commands::pubsub::NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
+    // No `--requirepass` means the connection is already allowed to run
+    // commands. Otherwise it stays locked until `AUTH` succeeds.
+    let mut authenticated = server.requirepass.is_none();
     loop {
         let value = match handler.read_value().await {
             Ok(Some(v)) => v,
@@ -475,11 +778,36 @@ async fn handle_conn(stream: TcpStream, server: Server) -> Result<()> {
             }
         };
 
+        let name = command_name(&value);
+        // `QUIT` closes the connection. It is allowed before `AUTH` so a
+        // client can hang up without first logging in.
+        if name.as_deref() == Some("quit") {
+            let _ = handler
+                .write_value(Value::SimpleString("OK".to_string()))
+                .await;
+            return Ok(());
+        }
+        // `AUTH` changes this connection's login flag, which lives on the
+        // task rather than in the shared server, so it is handled before
+        // dispatch. Inside `MULTI` it falls through and is queued; `EXEC`
+        // then rejects it, because a queued `AUTH` has no flag to flip.
+        if name.as_deref() == Some("auth") && !session.in_multi {
+            let response = authenticate(&value, server.requirepass.as_deref(), &mut authenticated);
+            handler.write_value(response).await?;
+            continue;
+        }
+        if !authenticated {
+            handler
+                .write_value(Value::Error("NOAUTH Authentication required.".to_string()))
+                .await?;
+            continue;
+        }
+
         // `PSYNC` turns this connection from a normal client into a replica: it
         // leaves the request/response loop for good and becomes a one-way stream
         // of commands the master pushes. Hand the whole connection off to
         // `serve_replica`, which never returns to this loop.
-        if command_name(&value).as_deref() == Some("psync") {
+        if name.as_deref() == Some("psync") {
             return serve_replica(handler, server).await;
         }
 
@@ -491,7 +819,7 @@ async fn handle_conn(stream: TcpStream, server: Server) -> Result<()> {
         // or disconnects. A `SUBSCRIBE` mid-transaction is left to flow into
         // `handle_command` instead, which rejects it like any other command that
         // can't be queued.
-        if command_name(&value).as_deref() == Some("subscribe") && !session.in_multi {
+        if name.as_deref() == Some("subscribe") && !session.in_multi {
             let (mut stream, mut buffer) = handler.into_parts();
             commands::pubsub::serve_subscriber(&mut stream, &mut buffer, &server, client_id, value)
                 .await?;
@@ -619,6 +947,10 @@ pub fn process_command(value: Value, server: &Server) -> Value {
             Some(v) => v.clone(),
             None => Value::SimpleString("PONG".to_string()),
         },
+        // Reached only from `EXEC` of a queued `AUTH`. The connection loop
+        // handles a top-level `AUTH` itself, because the login flag is not
+        // shared server state.
+        "auth" => Value::Error("ERR AUTH can't run inside a transaction".to_string()),
         "echo" => match args.first() {
             Some(v) => v.clone(),
             None => wrong_args("echo"),
@@ -628,6 +960,7 @@ pub fn process_command(value: Value, server: &Server) -> Value {
         "del" => del(&args, storage),
         "expire" => expire(&args, storage),
         "ttl" => ttl(&args, storage),
+        "dbsize" => dbsize(&args, storage),
         "persist" => persist(&args, storage),
         "type" => type_cmd(&args, storage),
         "rpush" => commands::lists::push(&args, storage, Side::Right),
@@ -656,7 +989,6 @@ pub fn process_command(value: Value, server: &Server) -> Value {
         "zincrby" => commands::sorted_sets::zincrby(&args, storage),
         "zrangebyscore" => commands::sorted_sets::zrangebyscore(&args, storage),
         "zcount" => commands::sorted_sets::zcount(&args, storage),
-        "dbsize" => dbsize(&args, storage),
         "info" => info(&args, server),
         "save" => commands::persistence::save(&args, server),
         "bgsave" => commands::persistence::bgsave(&args, server),
@@ -916,13 +1248,30 @@ fn expire(args: &[Value], storage: &Store) -> Value {
         store.remove(&key);
         return Value::Integer(1);
     }
-    match store.get_mut(&key) {
-        Some(e) => {
-            e.expires_at = Some(now + Duration::from_secs(secs as u64));
-            Value::Integer(1)
-        }
-        None => Value::Integer(0),
+    let updated = if let Some(entry) = store.get_mut(&key) {
+        entry.expires_at = Some(now + Duration::from_secs(secs as u64));
+        true
+    } else {
+        false
+    };
+    if updated {
+        store.sync_expiry(&key);
+        Value::Integer(1)
+    } else {
+        Value::Integer(0)
     }
+}
+
+/// `DBSIZE` — how many keys are stored right now.
+///
+/// Unlike `GET` and `TTL`, this does not passively expire anything. A key
+/// whose deadline has passed still counts until the active sweep, or some
+/// other command, removes it.
+fn dbsize(args: &[Value], storage: &Store) -> Value {
+    if !args.is_empty() {
+        return wrong_args("dbsize");
+    }
+    Value::Integer(storage.lock().unwrap().len() as i64)
 }
 
 /// `TTL key` — remaining time to live in seconds. `-2` if the key is missing,
@@ -960,12 +1309,18 @@ fn persist(args: &[Value], storage: &Store) -> Value {
     let now = Instant::now();
     let mut store = storage.lock().unwrap();
     expire_if_due(&mut store, &key, now);
-    match store.get_mut(&key) {
-        Some(e) if e.expires_at.is_some() => {
-            e.expires_at = None;
-            Value::Integer(1)
+    let cleared = match store.get_mut(&key) {
+        Some(entry) if entry.expires_at.is_some() => {
+            entry.expires_at = None;
+            true
         }
-        _ => Value::Integer(0),
+        _ => false,
+    };
+    if cleared {
+        store.sync_expiry(&key);
+        Value::Integer(1)
+    } else {
+        Value::Integer(0)
     }
 }
 
@@ -974,15 +1329,6 @@ fn persist(args: &[Value], storage: &Store) -> Value {
 /// list. The reply is a plain error frame beginning with the word `WRONGTYPE`.
 fn wrong_type() -> Value {
     Value::Error("WRONGTYPE Operation against a key holding the wrong kind of value".to_string())
-}
-
-/// `DBSIZE` — how many keys are stored right now. Expired keys that nobody
-/// has touched are still counted; nothing is deleted as a side effect.
-fn dbsize(args: &[Value], storage: &Store) -> Value {
-    if !args.is_empty() {
-        return wrong_args("dbsize");
-    }
-    Value::Integer(storage.lock().unwrap().len() as i64)
 }
 
 fn process_started() -> Instant {
@@ -1007,14 +1353,14 @@ fn info(args: &[Value], server: &Server) -> Value {
     if !args.is_empty() {
         return wrong_args("info");
     }
-    let map = server.store.lock().unwrap();
+    let space = server.store.lock().unwrap();
     let mut strings = 0usize;
     let mut lists = 0usize;
     let mut hashes = 0usize;
     let mut streams = 0usize;
     let mut zsets = 0usize;
     let mut memory = 0usize;
-    for (key, entry) in map.iter() {
+    for (key, entry) in space.entries.iter() {
         memory += key.len() + entry.value.byte_len();
         match &entry.value {
             StoredValue::Str(_) => strings += 1,
@@ -1024,8 +1370,8 @@ fn info(args: &[Value], server: &Server) -> Value {
             StoredValue::ZSet(_) => zsets += 1,
         }
     }
-    let keys = map.len();
-    drop(map);
+    let keys = space.len();
+    drop(space);
     let uptime = process_started().elapsed().as_secs();
     let text = format!(
         "# Server\r\n\
@@ -1046,6 +1392,57 @@ fn info(args: &[Value], server: &Server) -> Value {
         human = human_bytes(memory),
     );
     Value::BulkString(text)
+}
+
+/// `AUTH <password>` or `AUTH <username> <password>` — log this connection in
+/// when `--requirepass` is set.
+///
+/// The only username is `default` (the one-argument form implies it). Any
+/// other username is `WRONGPASS`, and the password is still compared so the
+/// reply does not skip the check. A match sets `authenticated`. A mismatch
+/// clears it, so a connection that was already logged in is logged out again.
+/// With no password configured the command is an error and the flag is left
+/// alone. A wrong number of arguments is also left alone: the password was
+/// never checked.
+fn authenticate(value: &Value, requirepass: Option<&str>, authenticated: &mut bool) -> Value {
+    let args = command_args(value);
+    if args.is_empty() || args.len() > 2 {
+        return wrong_args("auth");
+    }
+    let (username, password) = if args.len() == 1 {
+        (
+            "default".to_string(),
+            match unpack_bulk_str(&args[0]) {
+                Ok(password) => password,
+                Err(e) => return Value::Error(format!("ERR {e}")),
+            },
+        )
+    } else {
+        let username = match unpack_bulk_str(&args[0]) {
+            Ok(username) => username,
+            Err(e) => return Value::Error(format!("ERR {e}")),
+        };
+        let password = match unpack_bulk_str(&args[1]) {
+            Ok(password) => password,
+            Err(e) => return Value::Error(format!("ERR {e}")),
+        };
+        (username, password)
+    };
+    let Some(expected) = requirepass else {
+        return Value::Error("ERR AUTH called without any password configured".to_string());
+    };
+    // Both comparisons run to completion. `subtle` compares the bytes in
+    // constant time when the lengths match, and reports a mismatch when they
+    // do not.
+    let user_ok = subtle::ConstantTimeEq::ct_eq(username.as_bytes(), b"default".as_slice()).into();
+    let pass_ok = subtle::ConstantTimeEq::ct_eq(password.as_bytes(), expected.as_bytes()).into();
+    if user_ok && pass_ok {
+        *authenticated = true;
+        Value::SimpleString("OK".to_string())
+    } else {
+        *authenticated = false;
+        Value::Error("WRONGPASS invalid username-password pair or user is disabled.".to_string())
+    }
 }
 
 fn wrong_args(cmd: &str) -> Value {
@@ -1086,7 +1483,7 @@ mod tests {
     use super::*;
 
     fn store() -> Store {
-        Arc::new(Mutex::new(HashMap::new()))
+        empty_store()
     }
 
     fn bulk(s: &str) -> Value {
@@ -1146,6 +1543,7 @@ mod tests {
         for r in [
             "get",
             "ttl",
+            "dbsize",
             "type",
             "llen",
             "lrange",
@@ -1158,6 +1556,7 @@ mod tests {
             "wait",
             "replconf",
             "psync",
+            "auth",
             "xlen",
             "xrange",
             "xrevrange",
@@ -1362,6 +1761,111 @@ mod tests {
         assert_eq!(ttl(&[bulk("k")], &s), Value::Integer(50));
     }
 
+    fn timed(value: &str, expires_at: Option<Instant>) -> Entry {
+        Entry {
+            value: StoredValue::Str(value.to_string()),
+            expires_at,
+        }
+    }
+
+    #[test]
+    fn dbsize_counts_stored_keys_and_rejects_arguments() {
+        let s = store();
+        assert_eq!(dbsize(&[], &s), Value::Integer(0));
+        set(&[bulk("k"), bulk("v")], &s);
+        assert_eq!(dbsize(&[], &s), Value::Integer(1));
+        assert_eq!(dbsize(&[bulk("x")], &s), wrong_args("dbsize"));
+    }
+
+    #[test]
+    fn dbsize_still_counts_a_key_whose_deadline_has_passed() {
+        let s = store();
+        set(&[bulk("gone"), bulk("v"), bulk("PX"), bulk("1")], &s);
+        set(&[bulk("keep"), bulk("v")], &s);
+        std::thread::sleep(Duration::from_millis(5));
+        // Nothing has touched "gone", and DBSIZE itself does not expire, so
+        // both keys are still stored.
+        assert_eq!(dbsize(&[], &s), Value::Integer(2));
+        let mut rng = 1u64;
+        expire_cycle(&mut s.lock().unwrap(), &mut rng);
+        assert_eq!(dbsize(&[], &s), Value::Integer(1));
+        assert!(s.lock().unwrap().contains_key("keep"));
+    }
+
+    #[test]
+    fn active_expire_sample_clears_expired_keys_across_passes() {
+        let now = Instant::now();
+        let mut space = Keyspace::default();
+        // More expired keys than one sample of 20, so the >25% rule has to
+        // run a second pass or some of them would survive.
+        for i in 0..25 {
+            space.insert(
+                format!("e{i}"),
+                timed("v", Some(now - Duration::from_secs(1))),
+            );
+        }
+        space.insert("keep".to_string(), timed("v", None));
+        space.insert(
+            "later".to_string(),
+            timed("v", Some(now + Duration::from_secs(60))),
+        );
+        assert_eq!(space.expiring.len(), 26);
+        let mut rng = 1u64;
+        // The deadlines are relative to `now`, so run the passes against that
+        // instant rather than a later clock.
+        for _ in 0..EXPIRE_CYCLE_MAX_PASSES {
+            match expire_one_pass(&mut space, now, &mut rng) {
+                None | Some(false) => break,
+                Some(true) => {}
+            }
+        }
+        assert_eq!(
+            space.len(),
+            2,
+            "only the immortal key and the future TTL remain"
+        );
+        assert!(space.contains_key("keep"));
+        assert!(space.contains_key("later"));
+        assert_eq!(space.expiring.len(), 1);
+    }
+
+    #[test]
+    fn active_expire_sample_leaves_a_keyspace_of_future_ttls_untouched() {
+        let now = Instant::now();
+        let mut space = Keyspace::default();
+        for i in 0..10 {
+            space.insert(
+                format!("k{i}"),
+                timed("v", Some(now + Duration::from_secs(30))),
+            );
+        }
+        let mut rng = 1u64;
+        assert_eq!(expire_one_pass(&mut space, now, &mut rng), Some(false));
+        assert_eq!(space.len(), 10);
+        assert_eq!(space.expiring.len(), 10);
+    }
+
+    #[test]
+    fn expiry_index_tracks_set_expire_persist_del_and_rename() {
+        let s = store();
+        set(&[bulk("a"), bulk("v"), bulk("EX"), bulk("50")], &s);
+        set(&[bulk("b"), bulk("v")], &s);
+        assert_eq!(s.lock().unwrap().expiring.len(), 1);
+        assert_eq!(persist(&[bulk("a")], &s), Value::Integer(1));
+        assert_eq!(s.lock().unwrap().expiring.len(), 0);
+        assert_eq!(expire(&[bulk("b"), bulk("10")], &s), Value::Integer(1));
+        assert_eq!(s.lock().unwrap().expiring.len(), 1);
+        assert!(s.lock().unwrap().rename("b", "c".to_string()));
+        assert!(s.lock().unwrap().get("c").unwrap().expires_at.is_some());
+        assert_eq!(s.lock().unwrap().expiring.len(), 1);
+        assert_eq!(del(&[bulk("c")], &s), Value::Integer(1));
+        assert_eq!(s.lock().unwrap().expiring.len(), 0);
+        // A plain SET replaces an expiring key with one that lives forever.
+        set(&[bulk("d"), bulk("v"), bulk("EX"), bulk("10")], &s);
+        set(&[bulk("d"), bulk("w")], &s);
+        assert_eq!(s.lock().unwrap().expiring.len(), 0);
+    }
+
     #[test]
     fn persist_removes_expiry_and_reports_correctly() {
         let s = store();
@@ -1427,7 +1931,47 @@ mod tests {
         assert_eq!(cfg.port, 6379);
         assert_eq!(cfg.dir, ".");
         assert_eq!(cfg.dbfilename, "dump.rdb");
+        assert_eq!(cfg.requirepass, None);
         assert_eq!(cfg.addr(), "127.0.0.1:6379");
+    }
+
+    #[test]
+    fn config_parses_requirepass() {
+        let cfg = Config::parse(argv(&["--requirepass", "secret"])).unwrap();
+        assert_eq!(cfg.requirepass.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn config_reports_a_missing_requirepass_value() {
+        let err = Config::parse(argv(&["--requirepass"])).unwrap_err();
+        assert_eq!(err, "missing value for --requirepass option");
+    }
+
+    fn auth_frame(parts: &[&str]) -> Value {
+        Value::Array(parts.iter().map(|part| bulk(part)).collect())
+    }
+
+    #[test]
+    fn auth_accepts_the_default_user_and_rejects_any_other() {
+        let mut authed = false;
+        assert_eq!(
+            authenticate(
+                &auth_frame(&["AUTH", "default", "secret"]),
+                Some("secret"),
+                &mut authed
+            ),
+            Value::SimpleString("OK".to_string())
+        );
+        assert!(authed);
+        // A different username fails even when the password bytes match, and
+        // clears a login that was already established.
+        let reply = authenticate(
+            &auth_frame(&["AUTH", "alice", "secret"]),
+            Some("secret"),
+            &mut authed,
+        );
+        assert!(matches!(reply, Value::Error(text) if text.starts_with("WRONGPASS")));
+        assert!(!authed);
     }
 
     #[test]
@@ -1512,6 +2056,7 @@ mod tests {
             dir: "/nonexistent-flashdb-dir".to_string(),
             dbfilename: "nope.rdb".to_string(),
             replicaof: None,
+            requirepass: None,
         };
         let map = load_store_from_rdb(&cfg).expect("a missing file is not an error");
         assert!(map.is_empty());
