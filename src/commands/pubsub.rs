@@ -331,11 +331,10 @@ fn handle_sub_command(
 mod tests {
     use super::*;
     use crate::Store;
-    use std::collections::HashMap as StdHashMap;
     use std::path::PathBuf;
 
     fn store() -> Store {
-        Arc::new(Mutex::new(StdHashMap::new()))
+        crate::empty_store()
     }
 
     fn bulk(s: &str) -> Value {

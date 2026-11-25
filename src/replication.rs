@@ -273,8 +273,6 @@ mod tests {
     use super::*;
     use crate::rdb::RdbEntry;
     use crate::StoredValue;
-    use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
     use tokio::io::AsyncReadExt;
 
     #[test]
@@ -363,7 +361,7 @@ mod tests {
         let mut conn = ReplConn::new(client);
         let rdb_bytes = conn.handshake(6380).await.unwrap();
         drop(conn); // let the master task observe EOF and finish
-        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        let store: Store = crate::empty_store();
         load_rdb_into_store(&rdb_bytes, &store).unwrap();
 
         // Scope the guard in its own block so it can't be held across the await
