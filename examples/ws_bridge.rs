@@ -40,6 +40,8 @@ Usage: ws_bridge [--public] [--listen ADDR] [--flashdb ADDR] [--dir PATH]
   --data-dir PATH           ephemeral session directory in --public (env FLASHDB_DATA_DIR)
   --allow-origin ORIGIN     browser Origin allowed to open /ws (repeatable; required with --public)
   --max-sessions N          concurrent public sessions (default 32)
+  --max-sessions-per-client N
+                            sessions from one client address (default 4)
   --max-memory BYTES        payload bytes per session (default 1048576)
   --max-key-bytes N         max key length (default 1024)
   --max-value-bytes N       max value length (default 8192)
@@ -111,10 +113,10 @@ async fn main() -> Result<()> {
     }
     let config = Arc::new(config);
     loop {
-        let (stream, _) = listener.accept().await?;
+        let (stream, peer) = listener.accept().await?;
         let config = Arc::clone(&config);
         tokio::spawn(async move {
-            if let Err(e) = handle_client(stream, &config).await {
+            if let Err(e) = handle_client(stream, peer.ip(), &config).await {
                 eprintln!("playground client error: {e:#}");
             }
         });
@@ -160,6 +162,7 @@ fn parse_args() -> std::result::Result<BridgeConfig, String> {
         Some("1") | Some("true") | Some("yes")
     );
     let mut max_sessions = None;
+    let mut max_per_client = None;
     let mut max_memory = None;
     let mut max_key = None;
     let mut max_value = None;
@@ -179,6 +182,7 @@ fn parse_args() -> std::result::Result<BridgeConfig, String> {
             "--data-dir" => data_dir = Some(value()?),
             "--allow-origin" => allow_origins.push(value()?),
             "--max-sessions" => max_sessions = Some(value()?),
+            "--max-sessions-per-client" => max_per_client = Some(value()?),
             "--max-memory" => max_memory = Some(value()?),
             "--max-key-bytes" => max_key = Some(value()?),
             "--max-value-bytes" => max_value = Some(value()?),
@@ -219,6 +223,11 @@ fn parse_args() -> std::result::Result<BridgeConfig, String> {
     };
     let limits = public_mode::Limits {
         max_sessions: parse_flag(max_sessions, "FLASHDB_MAX_SESSIONS", defaults.max_sessions)?,
+        max_per_client: parse_flag(
+            max_per_client,
+            "FLASHDB_MAX_SESSIONS_PER_CLIENT",
+            defaults.max_per_client,
+        )?,
         max_memory: parse_flag(max_memory, "FLASHDB_MAX_MEMORY", defaults.max_memory)?,
         max_key: parse_flag(max_key, "FLASHDB_MAX_KEY_BYTES", defaults.max_key)?,
         max_value: parse_flag(max_value, "FLASHDB_MAX_VALUE_BYTES", defaults.max_value)?,
@@ -234,6 +243,7 @@ fn parse_args() -> std::result::Result<BridgeConfig, String> {
         )? as u64),
     };
     if limits.max_sessions == 0
+        || limits.max_per_client == 0
         || limits.max_memory == 0
         || limits.max_key == 0
         || limits.max_value == 0
@@ -242,7 +252,7 @@ fn parse_args() -> std::result::Result<BridgeConfig, String> {
     {
         return Err("session limits must be greater than zero".to_string());
     }
-    let gate = public_mode::Gate::new(limits.max_sessions);
+    let gate = public_mode::Gate::new(limits.max_sessions, limits.max_per_client);
     Ok(BridgeConfig {
         listen,
         flashdb,
@@ -255,7 +265,11 @@ fn parse_args() -> std::result::Result<BridgeConfig, String> {
     })
 }
 
-async fn handle_client(mut stream: TcpStream, config: &BridgeConfig) -> Result<()> {
+async fn handle_client(
+    mut stream: TcpStream,
+    client: std::net::IpAddr,
+    config: &BridgeConfig,
+) -> Result<()> {
     let head = read_headers(&mut stream).await?;
     let request = parse_request(&head)?;
     if request.path == "/healthz" {
@@ -285,23 +299,41 @@ async fn handle_client(mut stream: TcpStream, config: &BridgeConfig) -> Result<(
             .websocket_key
             .context("WebSocket upgrade is missing Sec-WebSocket-Key")?;
         if config.public {
-            return public_session(&mut stream, &key, config).await;
+            return public_session(&mut stream, &key, client, config).await;
         }
         return websocket_session(&mut stream, &key, &config.flashdb).await;
     }
     serve_static(&mut stream, &config.root, &request.path).await
 }
 
-async fn public_session(stream: &mut TcpStream, key: &str, config: &BridgeConfig) -> Result<()> {
-    let Some(_permit) = config.gate.try_enter() else {
-        return write_http(
-            stream,
-            503,
-            "Service Unavailable",
-            "text/plain; charset=utf-8",
-            b"too many sessions",
-        )
-        .await;
+async fn public_session(
+    stream: &mut TcpStream,
+    key: &str,
+    client: std::net::IpAddr,
+    config: &BridgeConfig,
+) -> Result<()> {
+    let _permit = match config.gate.try_enter(client) {
+        public_mode::Admit::Admitted(permit) => permit,
+        public_mode::Admit::TooManyForClient => {
+            return write_http(
+                stream,
+                503,
+                "Service Unavailable",
+                "text/plain; charset=utf-8",
+                b"too many sessions for this client",
+            )
+            .await
+        }
+        public_mode::Admit::TooManySessions => {
+            return write_http(
+                stream,
+                503,
+                "Service Unavailable",
+                "text/plain; charset=utf-8",
+                b"too many sessions",
+            )
+            .await
+        }
     };
     let id = SESSION_IDS.fetch_add(1, Ordering::Relaxed);
     let session_dir = public_mode::SessionDir::create(&config.data_dir, id).with_context(|| {
@@ -318,14 +350,19 @@ async fn public_session(stream: &mut TcpStream, key: &str, config: &BridgeConfig
     );
     stream.write_all(response.as_bytes()).await?;
     stream.flush().await?;
+    let max_message = public_mode::max_message_bytes(&config.limits);
     loop {
-        let frame = tokio::time::timeout(config.limits.idle, read_ws_text(stream)).await;
+        let frame =
+            tokio::time::timeout(config.limits.idle, read_ws_text(stream, max_message)).await;
         let line = match frame {
             Err(_) => {
                 let _ = write_ws_text(stream, "(error) ERR idle timeout").await;
                 break;
             }
-            Ok(Err(e)) => return Err(e),
+            Ok(Err(e)) => {
+                let _ = write_frame(stream, 0x8, &[]).await;
+                return Err(e);
+            }
             Ok(Ok(None)) => break,
             Ok(Ok(Some(line))) => line,
         };
@@ -508,7 +545,7 @@ async fn websocket_session(stream: &mut TcpStream, key: &str, flashdb: &str) -> 
     let mut db = None;
     let mut buf = Vec::new();
     loop {
-        let Some(line) = read_ws_text(stream).await? else {
+        let Some(line) = read_ws_text(stream, WS_MAX_MESSAGE).await? else {
             break;
         };
         let reply = match run_command(&mut db, &mut buf, flashdb, &line).await {
@@ -654,17 +691,27 @@ fn format_reply(value: &Value) -> String {
     rec(value, 0)
 }
 
-async fn read_ws_text(stream: &mut TcpStream) -> Result<Option<String>> {
+const WS_MAX_MESSAGE: usize = 1_000_000;
+
+async fn read_ws_text(stream: &mut TcpStream, max_message: usize) -> Result<Option<String>> {
     let mut message = Vec::new();
     let mut started = false;
     loop {
-        let (fin, opcode, payload) = read_frame(stream).await?;
+        let (fin, opcode, payload) = read_frame(stream, max_message).await?;
         match opcode {
             0x1 => {
+                if payload.len() > max_message {
+                    anyhow::bail!("websocket message is too large");
+                }
                 message = payload;
                 started = true;
             }
-            0x0 if started => message.extend_from_slice(&payload),
+            0x0 if started => {
+                if message.len().saturating_add(payload.len()) > max_message {
+                    anyhow::bail!("websocket message is too large");
+                }
+                message.extend_from_slice(&payload);
+            }
             0x8 => {
                 let _ = write_frame(stream, 0x8, &[]).await;
                 return Ok(None);
@@ -684,7 +731,7 @@ async fn read_ws_text(stream: &mut TcpStream) -> Result<Option<String>> {
     }
 }
 
-async fn read_frame(stream: &mut TcpStream) -> Result<(bool, u8, Vec<u8>)> {
+async fn read_frame(stream: &mut TcpStream, max_len: usize) -> Result<(bool, u8, Vec<u8>)> {
     let header = read_exact(stream, 2).await?;
     let fin = header[0] & 0x80 != 0;
     let opcode = header[0] & 0x0F;
@@ -700,7 +747,7 @@ async fn read_frame(stream: &mut TcpStream) -> Result<(bool, u8, Vec<u8>)> {
             anyhow::bail!("websocket frame length has the reserved high bit set");
         }
     }
-    if len > 1_000_000 {
+    if len > max_len as u64 {
         anyhow::bail!("websocket frame is too large");
     }
     if !masked {

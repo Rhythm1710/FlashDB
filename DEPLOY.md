@@ -14,10 +14,11 @@ The container listens on `$PORT` and answers `GET /healthz`. Set the Vercel orig
 | Variable | Required | Meaning |
 | --- | --- | --- |
 | `PORT` | set by Railway | Bind `0.0.0.0:$PORT`. |
-| `FLASHDB_ALLOW_ORIGIN` | yes | Comma-separated browser origins allowed to open `/ws`. Use `https://flashdb.rhythmarora.dev`. A missing or other `Origin` is rejected. |
-| `FLASHDB_PUBLIC` | no | `1` turns on public mode. The image already passes `--public`. |
+| `FLASHDB_ALLOW_ORIGIN` or `FLASHDB_ALLOW_ORIGINS` | yes | Comma-separated browser origins allowed to open `/ws`. Either name works. Use `https://flashdb.rhythmarora.dev`. A missing or other `Origin` is rejected. `--allow-origin` may be repeated for the same list. |
+| `FLASHDB_PUBLIC` | no | `1`, `true`, or `yes` turns public mode on. `0`, `false`, `no`, and an unset variable leave it off. The image already passes `--public`. |
 | `FLASHDB_DATA_DIR` | no | Ephemeral directory for per-session files. Default `/tmp/flashdb`. Also `--data-dir`, or `FLASHDB_DIR` / `DATA_DIR`. |
-| `FLASHDB_MAX_SESSIONS` | no | Concurrent sessions. Default `32`. |
+| `FLASHDB_MAX_SESSIONS` | no | Concurrent sessions across all clients. Default `32`. |
+| `FLASHDB_MAX_SESSIONS_PER_CLIENT` | no | Concurrent sessions from one client address. Default `4`. |
 | `FLASHDB_MAX_MEMORY` | no | Payload bytes per session. Default `1048576`. |
 | `FLASHDB_MAX_KEY_BYTES` | no | Default `1024`. |
 | `FLASHDB_MAX_VALUE_BYTES` | no | Default `8192`. |

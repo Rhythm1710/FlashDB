@@ -1,6 +1,6 @@
 # Public playground: one process serves the static page and gives every
 # browser WebSocket its own in-memory FlashDB. Railway sets $PORT.
-FROM rust:1-slim-bookworm AS build
+FROM rust:1.100.0-slim-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src

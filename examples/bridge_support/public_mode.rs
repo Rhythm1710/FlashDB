@@ -6,9 +6,11 @@
 
 use flashdb::resp::Value;
 use flashdb::Server;
+use std::collections::HashMap;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Caps applied to every public session. Flags and environment variables fill
@@ -16,6 +18,7 @@ use std::time::{Duration, Instant};
 #[derive(Clone, Debug)]
 pub struct Limits {
     pub max_sessions: usize,
+    pub max_per_client: usize,
     pub max_memory: usize,
     pub max_key: usize,
     pub max_value: usize,
@@ -27,6 +30,7 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             max_sessions: 32,
+            max_per_client: 4,
             max_memory: 1024 * 1024,
             max_key: 1024,
             max_value: 8 * 1024,
@@ -36,30 +40,55 @@ impl Default for Limits {
     }
 }
 
+/// Largest WebSocket text message a public session will assemble: one key,
+/// one value, and a little room for the command word and separators.
+pub fn max_message_bytes(limits: &Limits) -> usize {
+    limits
+        .max_key
+        .saturating_add(limits.max_value)
+        .saturating_add(256)
+}
+
 /// How many public sessions are open. `try_enter` fails when the cap is hit,
 /// and dropping the permit frees the slot even if the task panics.
 pub struct Gate {
     current: AtomicUsize,
     max: usize,
+    max_per_client: usize,
+    clients: Mutex<HashMap<IpAddr, usize>>,
 }
 
 pub struct Permit {
     gate: Arc<Gate>,
+    client: IpAddr,
+}
+
+pub enum Admit {
+    Admitted(Permit),
+    TooManySessions,
+    TooManyForClient,
 }
 
 impl Gate {
-    pub fn new(max: usize) -> Arc<Self> {
+    pub fn new(max: usize, max_per_client: usize) -> Arc<Self> {
         Arc::new(Self {
             current: AtomicUsize::new(0),
             max: max.max(1),
+            max_per_client: max_per_client.max(1),
+            clients: Mutex::new(HashMap::new()),
         })
     }
 
-    pub fn try_enter(self: &Arc<Self>) -> Option<Permit> {
+    pub fn try_enter(self: &Arc<Self>, client: IpAddr) -> Admit {
+        let mut clients = self.clients.lock().unwrap();
+        let open = clients.get(&client).copied().unwrap_or(0);
+        if open >= self.max_per_client {
+            return Admit::TooManyForClient;
+        }
         let mut current = self.current.load(Ordering::Relaxed);
         loop {
             if current >= self.max {
-                return None;
+                return Admit::TooManySessions;
             }
             match self.current.compare_exchange_weak(
                 current,
@@ -68,9 +97,11 @@ impl Gate {
                 Ordering::Relaxed,
             ) {
                 Ok(_) => {
-                    return Some(Permit {
+                    *clients.entry(client).or_insert(0) += 1;
+                    return Admit::Admitted(Permit {
                         gate: Arc::clone(self),
-                    })
+                        client,
+                    });
                 }
                 Err(actual) => current = actual,
             }
@@ -81,6 +112,13 @@ impl Gate {
 impl Drop for Permit {
     fn drop(&mut self) {
         self.gate.current.fetch_sub(1, Ordering::AcqRel);
+        let mut clients = self.gate.clients.lock().unwrap();
+        if let Some(count) = clients.get_mut(&self.client) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                clients.remove(&self.client);
+            }
+        }
     }
 }
 
@@ -235,17 +273,8 @@ fn command_has_key(name: &str) -> bool {
     )
 }
 
-/// Bytes a write would add, used as a ceiling before the command runs.
-pub fn stored_bytes(parts: &[String]) -> usize {
-    let Some(name) = parts.first() else {
-        return 0;
-    };
-    match name.to_ascii_lowercase().as_str() {
-        "set" | "rpush" | "lpush" | "hset" | "xadd" | "zadd" | "append" => {
-            parts.iter().skip(1).map(String::len).sum()
-        }
-        _ => 0,
-    }
+fn changes_keyspace(name: &str) -> bool {
+    flashdb::is_write_command(name) || name == "exec"
 }
 
 pub fn run_command(
@@ -267,20 +296,29 @@ pub fn run_command(
     if let Some(reason) = size_reason(parts, limits) {
         return Err(reason);
     }
-    let extra = stored_bytes(parts);
-    if extra > 0 && server.used_memory().saturating_add(extra) > limits.max_memory {
-        return Err(format!(
-            "ERR session memory limit exceeded (max {} bytes)",
-            limits.max_memory
-        ));
-    }
+    let name = parts[0].to_ascii_lowercase();
+    let snapshot = if changes_keyspace(&name) {
+        Some(server.snapshot_entries())
+    } else {
+        None
+    };
     let value = Value::Array(
         parts
             .iter()
             .map(|part| Value::BulkString(part.clone()))
             .collect(),
     );
-    Ok(flashdb::process_command(value, server))
+    let reply = flashdb::process_command(value, server);
+    if server.used_memory() > limits.max_memory {
+        if let Some(entries) = snapshot {
+            server.restore_entries(entries);
+        }
+        return Err(format!(
+            "ERR session memory limit exceeded (max {} bytes)",
+            limits.max_memory
+        ));
+    }
+    Ok(reply)
 }
 
 #[cfg(test)]
@@ -294,6 +332,7 @@ mod tests {
     fn limits() -> Limits {
         Limits {
             max_sessions: 2,
+            max_per_client: 1,
             max_memory: 64,
             max_key: 4,
             max_value: 8,
@@ -361,6 +400,7 @@ mod tests {
             max_key: 100,
             max_value: 100,
             max_per_sec: 100,
+            max_per_client: 4,
             ..limits()
         };
         let now = Instant::now();
@@ -426,14 +466,68 @@ mod tests {
         )
         .unwrap_err();
         assert!(memory.contains("memory limit"), "{memory}");
+        assert_eq!(server.used_memory(), 0, "the oversized SET is rolled back");
+    }
+
+    #[test]
+    fn memory_cap_rolls_back_a_new_sorted_set_member() {
+        let server = Server::isolated(PathBuf::from("unused.rdb"));
+        let limits = Limits {
+            max_memory: 12,
+            max_key: 64,
+            max_value: 64,
+            max_per_sec: 20,
+            max_sessions: 2,
+            max_per_client: 2,
+            idle: Duration::from_secs(30),
+        };
+        let mut rate = RateWindow::new(20);
+        let now = Instant::now();
+        run_command(&server, &mut rate, &limits, &parts(&["SET", "k", "v"]), now).unwrap();
+        let before = server.used_memory();
+        let err = run_command(
+            &server,
+            &mut rate,
+            &limits,
+            &parts(&["ZINCRBY", "z", "1", "abcdefgh"]),
+            now,
+        )
+        .unwrap_err();
+        assert!(err.contains("memory limit"), "{err}");
+        assert_eq!(server.used_memory(), before);
+        let score = run_command(
+            &server,
+            &mut rate,
+            &limits,
+            &parts(&["ZSCORE", "z", "abcdefgh"]),
+            now,
+        )
+        .unwrap();
+        assert_eq!(score, Value::Null);
     }
 
     #[test]
     fn the_session_gate_stops_at_the_cap() {
-        let gate = Gate::new(1);
-        let first = gate.try_enter().expect("first session");
-        assert!(gate.try_enter().is_none());
+        let gate = Gate::new(1, 4);
+        let client = IpAddr::from([127, 0, 0, 1]);
+        let other = IpAddr::from([127, 0, 0, 2]);
+        let Admit::Admitted(first) = gate.try_enter(client) else {
+            panic!("first session");
+        };
+        assert!(matches!(gate.try_enter(other), Admit::TooManySessions));
         drop(first);
-        assert!(gate.try_enter().is_some());
+        assert!(matches!(gate.try_enter(other), Admit::Admitted(_)));
+    }
+
+    #[test]
+    fn one_client_cannot_take_every_session_slot() {
+        let gate = Gate::new(8, 1);
+        let first = IpAddr::from([10, 0, 0, 1]);
+        let second = IpAddr::from([10, 0, 0, 2]);
+        let Admit::Admitted(_hold) = gate.try_enter(first) else {
+            panic!("first client");
+        };
+        assert!(matches!(gate.try_enter(first), Admit::TooManyForClient));
+        assert!(matches!(gate.try_enter(second), Admit::Admitted(_)));
     }
 }

@@ -103,6 +103,7 @@ impl StoredValue {
 /// the request that created it only until a chosen `Instant`. `expires_at` of
 /// `None` means "lives forever"; `Some(deadline)` means the key is gone the
 /// moment `Instant::now()` passes `deadline`.
+#[derive(Clone)]
 pub struct Entry {
     value: StoredValue,
     expires_at: Option<Instant>,
@@ -665,6 +666,17 @@ impl Server {
             .map(|(key, entry)| key.len() + entry.value.byte_len())
             .sum()
     }
+
+    /// Copy the keyspace so a public session can undo a write that exceeds
+    /// its memory cap. The expiry index is rebuilt on [`restore_entries`].
+    pub fn snapshot_entries(&self) -> HashMap<String, Entry> {
+        self.store.lock().unwrap().entries.clone()
+    }
+
+    /// Replace the keyspace, including the TTL index, with `entries`.
+    pub fn restore_entries(&self, entries: HashMap<String, Entry>) {
+        *self.store.lock().unwrap() = Keyspace::from_map(entries);
+    }
 }
 
 /// Borrow a command frame's argument values (everything after the command name),
@@ -1062,7 +1074,7 @@ fn bump_versions(versions: &Versions, name: &str, args: &[Value]) {
 /// streamed to replicas; reads stay local to whichever server received them.
 /// Kept as one list so it's obvious which commands replicate — extend it in
 /// lock-step with the dispatch table above whenever a new write lands.
-fn is_write_command(name: &str) -> bool {
+pub fn is_write_command(name: &str) -> bool {
     matches!(
         name,
         "set"
