@@ -39,7 +39,49 @@ body {
 
 button, input { font: inherit; touch-action: manipulation; }
 
-button:focus-visible, input:focus-visible, a:focus-visible {
+button,
+a[href],
+label,
+summary,
+select,
+[role="button"],
+[role="tab"],
+input[type="button"],
+input[type="submit"],
+input[type="reset"],
+input[type="checkbox"],
+input[type="radio"],
+input[type="file"] {
+  cursor: pointer;
+}
+
+input[type="text"],
+input[type="search"],
+input[type="email"],
+input[type="password"],
+input[type="url"],
+input[type="tel"],
+input[type="number"],
+textarea {
+  cursor: text;
+}
+
+button:disabled,
+input:disabled,
+select:disabled,
+textarea:disabled,
+[aria-disabled="true"] {
+  cursor: not-allowed;
+}
+
+button:focus-visible,
+input:focus-visible,
+a:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+summary:focus-visible,
+[role="button"]:focus-visible,
+[role="tab"]:focus-visible {
   outline: 3px solid var(--flash);
   outline-offset: 2px;
 }
@@ -203,6 +245,12 @@ h1 {
 
 .search input:focus { outline: none; }
 
+.search:has(input:focus-visible) {
+  border-color: var(--flash);
+  outline: 3px solid var(--flash);
+  outline-offset: 2px;
+}
+
 .group { margin: 0 0 16px; }
 .group h2 {
   margin: 0 0 8px;
@@ -341,6 +389,8 @@ h1 {
   font-size: 17px;
 }
 
+#composer input:focus-visible { border-color: var(--flash); }
+
 #composer button {
   min-height: 52px;
   padding: 0 18px;
@@ -381,6 +431,8 @@ h1 {
 
 .tabs button[aria-selected="true"] { color: var(--flash); font-weight: 600; }
 
+.tabs button:focus-visible { outline-offset: -3px; }
+
 .sr-only {
   position: absolute;
   width: 1px;
@@ -390,4 +442,38 @@ h1 {
   overflow: hidden;
   clip: rect(0, 0, 0, 0);
   border: 0;
+}
+
+/* Only devices that can hover pick up these styles, so a tap on a
+   phone does not leave the control looking pressed. Fill is the page
+   paper; the accent is the same orange as the selected tab. */
+@media (hover: hover) {
+  .tabs button:not(:disabled):not([aria-disabled="true"]):hover {
+    background: var(--paper);
+    color: var(--flash);
+    box-shadow: inset 0 -2px 0 var(--flash);
+  }
+
+  .gh:hover {
+    background: var(--paper);
+    color: var(--flash);
+    border-color: var(--flash);
+  }
+
+  .cmd:not(:disabled):not([aria-disabled="true"]):hover {
+    background: var(--paper);
+    color: var(--flash);
+    border-color: var(--flash);
+  }
+
+  #composer button:not(:disabled):not([aria-disabled="true"]):hover {
+    background: var(--paper);
+    color: var(--flash);
+    box-shadow: inset 0 0 0 2px var(--flash);
+  }
+
+  .search:has(input:not(:disabled)):hover,
+  #composer input:not(:disabled):hover {
+    border-color: var(--flash);
+  }
 }
